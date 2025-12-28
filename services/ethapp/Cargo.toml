@@ -1,0 +1,63 @@
+[package]
+name = "ethapp"
+version = "0.1.0"
+edition = "2021"
+description = "Native Ethereum App for Xous on Baochip-1x"
+license = "Apache-2.0 OR MIT"
+
+[[bin]]
+name = "ethapp"
+path = "src/main.rs"
+
+[features]
+default = []
+# Enable blind signing for pre-hashed EIP-712
+blind-signing = []
+# Enable Eth2/BLS operations (requires BLS crate)
+eth2 = []
+# Development mode with ephemeral test seed (INSECURE)
+dev-mode = []
+# Auto-approve for testing (INSECURE)
+autoapprove = []
+
+[dependencies]
+# Xous core
+xous = "0.9"
+xous-ipc = "0.10"
+xous-names = "0.9"
+
+# Common types
+ethapp-common = { path = "../ethapp-common" }
+
+# Serialization
+rkyv = { version = "0.7", default-features = false, features = ["alloc", "size_32", "validation"] }
+
+# Numeric conversions
+num-traits = { version = "0.2", default-features = false }
+num-derive = "0.4"
+
+# Cryptography
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic"] }
+sha2 = { version = "0.10", default-features = false }
+tiny-keccak = { version = "2.0", features = ["keccak"] }
+hmac = { version = "0.12", default-features = false }
+zeroize = { version = "1.7", default-features = false, features = ["derive"] }
+
+# BIP32 key derivation
+bip32 = { version = "0.5", default-features = false, features = ["secp256k1", "alloc"] }
+
+# Hex encoding
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
+
+# Random number generation for host builds
+getrandom = { version = "0.2", default-features = false, features = ["std"] }
+
+# Logging
+log = "0.4"
+
+[dev-dependencies]
+hex-literal = "0.4"
+
+[target.'cfg(target_os = "xous")'.dependencies]
+# Xous-specific dependencies that are only available on Xous target
+# These would include GAM, PDDB, TRNG connections

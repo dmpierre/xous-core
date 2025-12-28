@@ -1,0 +1,193 @@
+//! Error types for the Xous Ethereum App.
+//!
+//! Error codes are kept minimal to avoid leaking security-relevant
+//! information to potentially malicious callers.
+
+use core::fmt;
+use num_derive::{FromPrimitive, ToPrimitive};
+use rkyv::{Archive, Deserialize, Serialize};
+
+/// Error codes for the Ethereum App.
+///
+/// Each variant maps to a specific error condition.
+/// Messages are intentionally terse to avoid information leakage.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Archive, Serialize, Deserialize, FromPrimitive, ToPrimitive,
+)]
+#[archive(check_bytes)]
+#[repr(u32)]
+pub enum EthAppError {
+    /// Operation completed successfully (not an error).
+    Success = 0x00,
+
+    /// User rejected the operation on the device.
+    RejectedByUser = 0x01,
+
+    /// Unknown or unsupported opcode.
+    InvalidOpcode = 0x02,
+
+    /// Invalid parameter in the request.
+    InvalidParameter = 0x03,
+
+    /// Malformed data in the request payload.
+    InvalidData = 0x04,
+
+    /// Signature verification failed.
+    InvalidSignature = 0x05,
+
+    /// Security policy violation.
+    SecurityViolation = 0x06,
+
+    /// Operation not supported by this build.
+    UnsupportedOperation = 0x07,
+
+    /// Internal error in the service.
+    InternalError = 0x08,
+
+    /// Operation timed out.
+    Timeout = 0x09,
+
+    /// Blind signing is disabled but required.
+    BlindSigningDisabled = 0x0A,
+
+    /// Required metadata not found in cache.
+    MetadataNotFound = 0x0B,
+
+    /// Invalid BIP32/44 derivation path.
+    InvalidDerivationPath = 0x0C,
+
+    /// Key derivation failed.
+    KeyDerivationFailed = 0x0D,
+
+    /// Signing operation failed.
+    SigningFailed = 0x0E,
+
+    /// Invalid transaction format.
+    InvalidTransaction = 0x0F,
+
+    /// Invalid RLP encoding.
+    InvalidRlp = 0x10,
+
+    /// Invalid message format.
+    InvalidMessage = 0x11,
+
+    /// Invalid EIP-712 typed data.
+    InvalidTypedData = 0x12,
+
+    /// Invalid state machine transition.
+    InvalidState = 0x13,
+
+    /// Chunked transfer error.
+    ChunkError = 0x14,
+
+    /// Buffer overflow or size limit exceeded.
+    BufferOverflow = 0x15,
+
+    /// Connection to required service failed.
+    ServiceConnectionFailed = 0x16,
+
+    /// IPC serialization/deserialization error.
+    SerializationError = 0x17,
+
+    /// Storage (PDDB) operation failed.
+    StorageError = 0x18,
+
+    /// UI/GAM operation failed.
+    UiError = 0x19,
+
+    /// Cryptographic operation failed.
+    CryptoError = 0x1A,
+}
+
+impl EthAppError {
+    /// Returns the error code as a u32 for scalar responses.
+    #[inline]
+    pub fn code(self) -> u32 {
+        self as u32
+    }
+
+    /// Returns true if this represents success.
+    #[inline]
+    pub fn is_success(self) -> bool {
+        matches!(self, EthAppError::Success)
+    }
+
+    /// Returns true if this is a user-initiated rejection.
+    #[inline]
+    pub fn is_user_rejection(self) -> bool {
+        matches!(self, EthAppError::RejectedByUser)
+    }
+
+    /// Returns true if this is a security-related error.
+    #[inline]
+    pub fn is_security_error(self) -> bool {
+        matches!(
+            self,
+            EthAppError::InvalidSignature
+                | EthAppError::SecurityViolation
+                | EthAppError::BlindSigningDisabled
+                | EthAppError::InvalidDerivationPath
+        )
+    }
+}
+
+impl Default for EthAppError {
+    fn default() -> Self {
+        EthAppError::Success
+    }
+}
+
+impl fmt::Display for EthAppError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Intentionally terse messages to avoid information leakage
+        match self {
+            EthAppError::Success => write!(f, "Success"),
+            EthAppError::RejectedByUser => write!(f, "Rejected by user"),
+            EthAppError::InvalidOpcode => write!(f, "Invalid opcode"),
+            EthAppError::InvalidParameter => write!(f, "Invalid parameter"),
+            EthAppError::InvalidData => write!(f, "Invalid data"),
+            EthAppError::InvalidSignature => write!(f, "Invalid signature"),
+            EthAppError::SecurityViolation => write!(f, "Security violation"),
+            EthAppError::UnsupportedOperation => write!(f, "Unsupported operation"),
+            EthAppError::InternalError => write!(f, "Internal error"),
+            EthAppError::Timeout => write!(f, "Timeout"),
+            EthAppError::BlindSigningDisabled => write!(f, "Blind signing disabled"),
+            EthAppError::MetadataNotFound => write!(f, "Metadata not found"),
+            EthAppError::InvalidDerivationPath => write!(f, "Invalid derivation path"),
+            EthAppError::KeyDerivationFailed => write!(f, "Key derivation failed"),
+            EthAppError::SigningFailed => write!(f, "Signing failed"),
+            EthAppError::InvalidTransaction => write!(f, "Invalid transaction"),
+            EthAppError::InvalidRlp => write!(f, "Invalid RLP"),
+            EthAppError::InvalidMessage => write!(f, "Invalid message"),
+            EthAppError::InvalidTypedData => write!(f, "Invalid typed data"),
+            EthAppError::InvalidState => write!(f, "Invalid state"),
+            EthAppError::ChunkError => write!(f, "Chunk error"),
+            EthAppError::BufferOverflow => write!(f, "Buffer overflow"),
+            EthAppError::ServiceConnectionFailed => write!(f, "Service connection failed"),
+            EthAppError::SerializationError => write!(f, "Serialization error"),
+            EthAppError::StorageError => write!(f, "Storage error"),
+            EthAppError::UiError => write!(f, "UI error"),
+            EthAppError::CryptoError => write!(f, "Crypto error"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_error_codes() {
+        assert_eq!(EthAppError::Success.code(), 0x00);
+        assert_eq!(EthAppError::RejectedByUser.code(), 0x01);
+        assert_eq!(EthAppError::CryptoError.code(), 0x1A);
+    }
+
+    #[test]
+    fn test_error_classification() {
+        assert!(EthAppError::Success.is_success());
+        assert!(!EthAppError::RejectedByUser.is_success());
+        assert!(EthAppError::RejectedByUser.is_user_rejection());
+        assert!(EthAppError::InvalidSignature.is_security_error());
+    }
+}

@@ -1,0 +1,28 @@
+[package]
+name = "ethapp-common"
+version = "0.1.0"
+edition = "2021"
+description = "Common types for Xous Ethereum App"
+license = "Apache-2.0 OR MIT"
+
+[features]
+default = []
+std = []
+
+[dependencies]
+# Serialization for Xous IPC
+rkyv = { version = "0.7", default-features = false, features = ["alloc", "size_32", "validation"] }
+
+# Numeric conversions for opcodes
+num-derive = "0.4"
+num-traits = { version = "0.2", default-features = false }
+
+# Serde for tests and host builds
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"], optional = true }
+
+# Zeroize for secret handling
+zeroize = { version = "1.7", default-features = false, features = ["derive"] }
+
+[dev-dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
