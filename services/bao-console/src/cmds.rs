@@ -101,6 +101,10 @@ mod i2cdetect;
 use i2cdetect::*;
 mod cute;
 use cute::*;
+mod eth;
+use eth::*;
+mod zec;
+use zec::*;
 #[cfg(feature = "rramtests")]
 mod rram;
 #[cfg(feature = "rramtests")]
@@ -119,6 +123,8 @@ pub struct CmdEnv {
     aes_cmd: Aes,
     #[cfg(feature = "rramtests")]
     rram: Rram,
+    eth: Eth,
+    zec: Zec,
 }
 impl CmdEnv {
     pub fn new(xns: &xous_names::XousNames) -> CmdEnv {
@@ -151,6 +157,8 @@ impl CmdEnv {
             aes_cmd,
             #[cfg(feature = "rramtests")]
             rram,
+            eth: Eth::new(),
+            zec: Zec::new(),
         }
     }
 
@@ -185,6 +193,8 @@ impl CmdEnv {
             &mut self.aes_cmd,
             #[cfg(feature = "rramtests")]
             &mut self.rram,
+            &mut self.eth,
+            &mut self.zec,
         ];
 
         if let Some(cmdline) = maybe_cmdline {

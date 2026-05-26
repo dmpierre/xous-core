@@ -27,9 +27,12 @@ bytemuck = "1.24.0"
 susres = { path = "../../api/xous-api-susres", package = "xous-api-susres" }
 keystore = { path = "../keystore" }
 keystore-api = { path = "../../libs/keystore-api" }
+ethapp-api = { path = "../../libs/ethapp-api" }
+zcashapp-api = { path = "../../libs/zcashapp-api" }
 
 bio-lib = { path = "../../libs/bio-lib", optional = true }
 arbitrary-int = "1.2"
+hex-literal = "0.4"
 
 # pddb testing
 rand = { version = "0.8.5", features = ["getrandom"], optional = true }
@@ -77,6 +80,8 @@ hosted-baosec = [
 ]
 hosted-dabao = [
     "hosted-bao",
+    "ethapp-api/hosted-dabao",
+    "zcashapp-api/hosted-dabao",
 ]
 # Don't use this for dabao. Use apps-dabao/dabao-console instead!
 # board-dabao = [
