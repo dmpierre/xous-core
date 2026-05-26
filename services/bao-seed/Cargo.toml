@@ -1,0 +1,72 @@
+[package]
+name = "bao-seed"
+version = "0.1.0"
+edition = "2021"
+description = "Seed vault service for Xous on Baochip-1x — owns BIP-39 seed bytes, exposes typed IPC for derivation and signing"
+license = "Apache-2.0 OR MIT"
+
+[[bin]]
+name = "bao-seed"
+path = "src/main.rs"
+
+# Dependency versions enforced by Cargo.lock.
+[dependencies]
+# Xous core
+xous = "0.9.70"
+xous-ipc = "0.10.10"
+xous-names = { package = "xous-api-names", version = "0.9.71" }
+log-server = { package = "xous-api-log", version = "0.1.69" }
+log = "0.4.14"
+
+# Common types
+bao-seed-common = { path = "../../libs/bao-seed-common" }
+
+# Serialization
+rkyv = { version = "0.8.8", default-features = false, features = ["std", "alloc"] }
+
+# Numeric conversions
+num-traits = { version = "0.2.14", default-features = false }
+num-derive = { version = "0.4.2", default-features = false }
+
+# BIP-39 wordlist + entropy↔words
+bip39-utils = { path = "../../libs/bip39-utils" }
+
+# Cryptography: PBKDF2-HMAC-SHA512 for BIP-39 seed derivation
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+hmac = { version = "0.12", default-features = false }
+sha2 = { version = "0.10.8" }
+zeroize = { version = "1.7.0", features = ["zeroize_derive"] }
+
+# secp256k1 ECDSA (Ethereum, Bitcoin)
+bip32 = { version = "0.5", default-features = false, features = ["secp256k1", "alloc"] }
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic"] }
+
+# Orchard / Pallas (Zcash shielded)
+orchard = { version = "0.13", default-features = false }
+pasta_curves = { version = "0.5", default-features = false }
+reddsa = { version = "0.5", default-features = false }
+zip32 = { version = "0.2", default-features = false }
+rand_core = { version = "0.6.4", default-features = false }
+
+[dev-dependencies]
+hex-literal = "0.4"
+tiny-keccak = { version = "2.0", features = ["keccak"] }
+# `OsRng` needs std (uses getrandom under the hood). Dev-only.
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+
+[target.'cfg(target_os = "xous")'.dependencies]
+trng = { path = "../trng" }
+rand_core = "0.6.4"
+pddb = { path = "../pddb", optional = true }
+
+[target.'cfg(not(target_os = "xous"))'.dependencies]
+getrandom = { version = "0.2", default-features = false, features = ["std"] }
+
+[features]
+default = []
+# Development mode with deterministic test seed (INSECURE)
+dev-mode = []
+# Board/target features (auto-injected by xtask)
+bao1x = []
+board-dabao = []
+hosted-dabao = []
