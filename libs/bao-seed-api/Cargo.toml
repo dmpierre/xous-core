@@ -1,0 +1,29 @@
+[package]
+name = "bao-seed-api"
+version = "0.1.0"
+edition = "2021"
+description = "Client library for the bao-seed Xous service"
+license = "Apache-2.0"
+
+[features]
+default = []
+# Enable std support for host testing
+std = ["bao-seed-common/std"]
+# Hosted-dabao mode: use real Xous IPC on the host target
+hosted-dabao = []
+
+# Dependency versions enforced by Cargo.lock.
+[dependencies]
+# Shared types and opcodes
+bao-seed-common = { path = "../bao-seed-common" }
+
+# Serialization for IPC
+rkyv = { version = "0.8.8", default-features = false, features = ["std", "alloc"] }
+
+# Numeric traits for opcodes
+num-traits = { version = "0.2.14", default-features = false }
+
+# Xous dependencies — unconditional so they're available in hosted-dabao mode too.
+xous = "0.9.70"
+xous-ipc = "0.10.10"
+xous-names = { package = "xous-api-names", version = "0.9.71" }

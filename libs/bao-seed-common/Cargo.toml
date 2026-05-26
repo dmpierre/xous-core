@@ -1,0 +1,27 @@
+[package]
+name = "bao-seed-common"
+version = "0.1.0"
+edition = "2021"
+description = "Common types for the bao-seed Xous service (seed vault)"
+license = "Apache-2.0 OR MIT"
+
+[features]
+default = []
+std = []
+
+# Dependency versions enforced by Cargo.lock.
+[dependencies]
+# Serialization for Xous IPC
+rkyv = { version = "0.8.8", default-features = false, features = ["alloc"] }
+
+# Numeric conversions for opcodes
+num-derive = { version = "0.4.2", default-features = false }
+num-traits = { version = "0.2.14", default-features = false }
+
+# Zeroize for any byte-shaped material that crosses the boundary.
+# Note: the Seed itself NEVER crosses this boundary; only fingerprints,
+# mnemonic words at generation/import time, and metadata.
+zeroize = { version = "1.7.0", features = ["zeroize_derive"] }
+
+[dev-dependencies]
+hex-literal = "0.4"
