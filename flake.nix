@@ -77,6 +77,16 @@
             src = self + "/locales";
           };
 
+          # Vendor holodi workspace dependencies. `holodi/` is the
+          # consolidated workspace covering cli (the `holodi` binary) +
+          # beth + zao (one Cargo.lock at `holodi/Cargo.lock`).
+          # Replaces the three separate `vendored{Beth,Zao,Holodi}Deps`
+          # derivations that existed when each tool was its own
+          # standalone workspace.
+          vendoredHolodiDeps = craneLib.vendorCargoDeps {
+            src = self + "/holodi";
+          };
+
           # Common postPatch to replace SemVer::from_git() with hardcoded version
           patchSemver = ''
             substituteInPlace tools/src/sign_image.rs \
@@ -111,6 +121,20 @@
 
             # Add locales-only crates into matching source dirs
             for dir in ${vendoredLocalesDeps}/*/; do
+              name=$(basename "$dir")
+              mkdir -p "$out/$name"
+              for crate in "$dir"/*; do
+                crate_name=$(basename "$crate")
+                if [ ! -e "$out/$name/$crate_name" ]; then
+                  ln -s "$crate" "$out/$name/$crate_name"
+                fi
+              done
+            done
+
+            # Add holodi workspace crates into matching source dirs
+            # (single workspace at `holodi/`; one Cargo.lock covers
+            # cli + beth + zao).
+            for dir in ${vendoredHolodiDeps}/*/; do
               name=$(basename "$dir")
               mkdir -p "$out/$name"
               for crate in "$dir"/*; do
@@ -231,11 +255,83 @@
               extensions = [ "rustfmt" ];
             }
           );
+
+          # Host-tool deps (e.g. for beth). On Linux serialport needs libudev
+          # via pkg-config; on macOS it uses IOKit and needs nothing extra.
+          hostToolDeps =
+            if pkgs.stdenv.isLinux
+            then [ pkgs.pkg-config pkgs.systemd ]
+            else [ ];
+
+          # Holodi workspace members (cli, beth, zao) are siblings under
+          # `holodi/`. The shared `[patch.crates-io] pczt` in
+          # `holodi/Cargo.toml` references `../imports/pczt`, so the
+          # src has to include both `holodi/` and `imports/pczt/`.
+          holodiWorkspaceSrc = pkgs.lib.cleanSourceWith {
+            src = self;
+            filter = path: type:
+              let
+                rel = pkgs.lib.removePrefix (toString self + "/") (toString path);
+                baseName = baseNameOf path;
+              in
+              # Keep only what's needed to build the holodi workspace.
+              (type == "directory"
+                && (rel == "" || rel == "holodi" || rel == "imports"
+                    || pkgs.lib.hasPrefix "holodi/" rel
+                    || pkgs.lib.hasPrefix "imports/pczt" rel))
+              || (
+                (pkgs.lib.hasPrefix "holodi/" rel || pkgs.lib.hasPrefix "imports/pczt/" rel)
+                && (baseName == "Cargo.toml"
+                    || baseName == "Cargo.lock"
+                    || pkgs.lib.hasSuffix ".rs" baseName
+                    || pkgs.lib.hasSuffix ".toml" baseName
+                    || pkgs.lib.hasSuffix ".md" baseName)
+              );
+          };
+
+          # Helper for the three rustPlatform package outputs that share
+          # the holodi workspace. Each selects its own bin via `--package`.
+          mkHolodiTool = { pname, description, mainProgram }: pkgs.rustPlatform.buildRustPackage {
+            inherit pname;
+            version = "0.1.0";
+            src = holodiWorkspaceSrc;
+            sourceRoot = "source/holodi";
+            cargoLock.lockFile = self + "/holodi/Cargo.lock";
+            cargoBuildFlags = [ "--package" pname ];
+            nativeBuildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.pkg-config ];
+            buildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.systemd ];
+            doCheck = false;
+            meta = with pkgs.lib; {
+              inherit description mainProgram;
+              platforms = platforms.unix;
+            };
+          };
+
+          # Host CLI for the Baochip-1x Ethereum hardware wallet.
+          beth = mkHolodiTool {
+            pname = "beth";
+            description = "Host CLI for the Baochip-1x Ethereum hardware wallet";
+            mainProgram = "beth";
+          };
+
+          # Host CLI for the Baochip-1x Zcash hardware wallet.
+          zao = mkHolodiTool {
+            pname = "zao";
+            description = "Host CLI for the Baochip-1x Zcash hardware wallet";
+            mainProgram = "zao";
+          };
+
+          # Unified host CLI — links beth + zao as libraries.
+          holodi = mkHolodiTool {
+            pname = "holodi";
+            description = "Unified host CLI for the Baochip hardware wallet (seed, eth, zec)";
+            mainProgram = "holodi";
+          };
         in
         {
           packages = {
             # Main packages
-            inherit dabao-helloworld bao1x-boot0 bao1x-alt-boot1 bao1x-boot1 bao1x-baremetal-dabao baosec;
+            inherit dabao-helloworld bao1x-boot0 bao1x-alt-boot1 bao1x-boot1 bao1x-baremetal-dabao baosec beth zao holodi;
 
             # bootloader stage 1
             boot1 = pkgs.runCommand "boot1" {} ''
@@ -267,7 +363,7 @@
 
           devShells = {
             default = pkgs.mkShell {
-              packages = [ pkgs.rustToolchainXous vendorSetup ];
+              packages = [ pkgs.rustToolchainXous vendorSetup ] ++ hostToolDeps;
               shellHook = ''
                 # Generate vendor config for offline builds
                 xous-vendor-setup
@@ -287,6 +383,8 @@
                 echo "  • nix build .#bao1x-boot0"
                 echo "  • nix build .#bao1x-boot1"
                 echo "  • nix build .#bao1x-alt-boot1"
+                echo "  • nix build .#beth                (host CLI)"
+                echo "  • nix build .#zao                 (host CLI)"
                 echo ""
                 echo "Aliases:"
                 echo "  • nix build .#dabao       (dabao-helloworld)"
@@ -301,7 +399,7 @@
 
           # For containerized / sandboxed environments without git tags
           container = pkgs.mkShell {
-            packages = [ pkgs.rustToolchainXous vendorSetup xousBuild ];
+            packages = [ pkgs.rustToolchainXous vendorSetup xousBuild ] ++ hostToolDeps;
             env = {
               XOUS_VERSION = xousVersion;
               GIT_REV = gitRevFull;
