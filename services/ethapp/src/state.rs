@@ -12,14 +12,6 @@
 //! - Settings loaded from PDDB are validated on read
 //! - State is cleared on service restart
 
-#[cfg(target_os = "xous")]
-use alloc::collections::BTreeMap;
-#[cfg(target_os = "xous")]
-use alloc::string::String;
-#[cfg(target_os = "xous")]
-use alloc::vec::Vec;
-
-#[cfg(not(target_os = "xous"))]
 use std::collections::BTreeMap;
 
 use ethapp_common::{
@@ -27,9 +19,9 @@ use ethapp_common::{
     PROTOCOL_VERSION,
 };
 
-#[cfg(target_os = "xous")]
+#[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
 use crate::platform::XousPlatform;
-#[cfg(not(target_os = "xous"))]
+#[cfg(not(any(target_os = "xous", feature = "hosted-dabao")))]
 use crate::platform::MockPlatform;
 
 use crate::platform::Platform;
@@ -40,13 +32,42 @@ const MAX_CACHE_SIZE: usize = 64;
 /// Service state.
 pub struct ServiceState {
     /// Platform abstraction.
-    #[cfg(target_os = "xous")]
+    #[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
     pub platform: XousPlatform,
-    #[cfg(not(target_os = "xous"))]
+    #[cfg(not(any(target_os = "xous", feature = "hosted-dabao")))]
     pub platform: MockPlatform,
 
     /// Application configuration.
     pub config: AppConfiguration,
+
+    /// Host-only legacy in-memory seed.
+    ///
+    /// Real-target builds (xous / hosted-dabao) delegate all seed
+    /// storage to bao-seed via `bao_seed_client`. This field only
+    /// exists for the host-test path, where bao-seed's IPC isn't
+    /// available and tests derive keys directly from `crypto::*`.
+    #[cfg(not(any(target_os = "xous", feature = "hosted-dabao")))]
+    pub imported_seed: Option<crate::crypto::Seed>,
+
+    /// Lazy connection to the bao-seed Xous service. The seed itself
+    /// lives in bao-seed; ethapp only sends `(path, hash)` and receives
+    /// signatures back.
+    #[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
+    pub bao_seed_client: Option<bao_seed_api::BaoSeedClient>,
+
+    /// Cached attestation signing key (loaded from PDDB on first use).
+    /// Independent of wallet seed — survives seed wipes.
+    pub attestation_key: Option<k256::ecdsa::SigningKey>,
+
+    /// Cached import key for ECIES encrypted mnemonic import (loaded from PDDB).
+    /// Independent of wallet seed — survives seed wipes.
+    pub import_key: Option<k256::ecdsa::SigningKey>,
+
+    /// DANGEROUS: when true, allows signing on mainnet chains even on
+    /// displayless dev-mode/autoapprove builds. Must be explicitly
+    /// enabled per session via the EnableDangerousMainnet opcode.
+    /// Resets to false on service restart.
+    pub dangerous_mainnet: bool,
 
     /// Cached token information (key: chain_id:address).
     token_cache: BTreeMap<(u64, EthAddress), TokenInfo>,
@@ -83,10 +104,17 @@ impl ServiceState {
     /// Create a new service state.
     pub fn new() -> Self {
         Self {
-            #[cfg(target_os = "xous")]
+            #[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
             platform: XousPlatform::new(),
-            #[cfg(not(target_os = "xous"))]
+            #[cfg(not(any(target_os = "xous", feature = "hosted-dabao")))]
             platform: MockPlatform::new(),
+            #[cfg(not(any(target_os = "xous", feature = "hosted-dabao")))]
+            imported_seed: None,
+            #[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
+            bao_seed_client: None,
+            attestation_key: None,
+            import_key: None,
+            dangerous_mainnet: false,
             config: AppConfiguration {
                 version_major: 0,
                 version_minor: 1,
@@ -109,6 +137,64 @@ impl ServiceState {
     /// Initialize platform connections.
     pub fn init_platform(&mut self) -> Result<(), EthAppError> {
         self.platform.init()
+    }
+
+    /// Lazily connect to bao-seed and return a borrow of the client.
+    ///
+    /// Returns `EthAppError::InternalError` if the connection cannot be
+    /// established. The connection is cached for subsequent calls.
+    #[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
+    pub fn bao_seed(&mut self) -> Result<&bao_seed_api::BaoSeedClient, EthAppError> {
+        if self.bao_seed_client.is_none() {
+            match bao_seed_api::BaoSeedClient::new() {
+                Ok(c) => self.bao_seed_client = Some(c),
+                Err(e) => {
+                    log::error!("ethapp: cannot connect to bao-seed: {:?}", e);
+                    return Err(EthAppError::InternalError);
+                }
+            }
+        }
+        Ok(self.bao_seed_client.as_ref().unwrap())
+    }
+
+    // =========================================================================
+    // Attestation Key
+    // =========================================================================
+
+    /// Get the attestation signing key, loading from PDDB if not cached.
+    pub fn get_attestation_key(&mut self) -> Result<&k256::ecdsa::SigningKey, EthAppError> {
+        if self.attestation_key.is_none() {
+            if let Ok(Some(bytes)) = self.platform.load_value(crate::platform::PDDB_KEY_ATTESTATION) {
+                if bytes.len() == 32 {
+                    if let Ok(key) = k256::ecdsa::SigningKey::from_bytes(
+                        (&bytes[..]).into()
+                    ) {
+                        self.attestation_key = Some(key);
+                    }
+                }
+            }
+        }
+        self.attestation_key.as_ref().ok_or(EthAppError::AttestationNotInitialized)
+    }
+
+    // =========================================================================
+    // Import Key
+    // =========================================================================
+
+    /// Get the import signing key, loading from PDDB if not cached.
+    pub fn get_import_key(&mut self) -> Result<&k256::ecdsa::SigningKey, EthAppError> {
+        if self.import_key.is_none() {
+            if let Ok(Some(bytes)) = self.platform.load_value(crate::platform::PDDB_KEY_IMPORT) {
+                if bytes.len() == 32 {
+                    if let Ok(key) = k256::ecdsa::SigningKey::from_bytes(
+                        (&bytes[..]).into()
+                    ) {
+                        self.import_key = Some(key);
+                    }
+                }
+            }
+        }
+        self.import_key.as_ref().ok_or(EthAppError::ImportKeyNotInitialized)
     }
 
     // =========================================================================

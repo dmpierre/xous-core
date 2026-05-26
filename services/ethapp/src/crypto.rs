@@ -38,15 +38,13 @@
 //! - docs/ecalls.md: ECALL patterns (for future hardware dispatch)
 //! - xous-core: ComboHash engine capabilities
 
-#[cfg(target_os = "xous")]
-use alloc::vec::Vec;
-
-#[cfg(not(target_os = "xous"))]
+use std::string::String;
 use std::vec::Vec;
+use std::string::ToString;
 
 use ethapp_common::{Bip32Path, EthAddress, EthAppError, Hash256, Signature, TransactionType};
 use k256::{
-    ecdsa::{signature::hazmat::PrehashSigner, RecoveryId, Signature as K256Signature, SigningKey},
+    ecdsa::{RecoveryId, Signature as K256Signature, SigningKey},
     elliptic_curve::sec1::ToEncodedPoint,
     PublicKey,
 };
@@ -284,7 +282,7 @@ impl HmacSha512Hasher {
 ///
 /// - Zeroized on drop to prevent residual secret material in memory.
 /// - The inner 64-byte array holds the full BIP39 seed.
-#[derive(Zeroize)]
+#[derive(Clone, Zeroize)]
 #[zeroize(drop)]
 pub struct Seed([u8; 64]);
 
@@ -327,6 +325,76 @@ pub fn get_dev_seed() -> Seed {
         0xce, 0x9e, 0x38, 0xe4,
     ];
     Seed::from_bytes(&seed_bytes)
+}
+
+/// Derive a BIP39 seed from a mnemonic using PBKDF2-HMAC-SHA512.
+///
+/// Standard BIP39: 2048 rounds, salt = "mnemonic" (no passphrase).
+pub fn seed_from_mnemonic(mnemonic: &[u8]) -> Seed {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha512;
+
+    type HmacSha512 = Hmac<Sha512>;
+
+    let salt = b"mnemonic"; // BIP39 with empty passphrase
+    let rounds = 2048;
+
+    // PBKDF2-HMAC-SHA512
+    let mut dk = [0u8; 64]; // derived key (512 bits)
+
+    // U1 = PRF(password, salt || INT_32_BE(1))
+    let mut salt_block = [0u8; 12]; // "mnemonic" (8) + block index (4)
+    salt_block[..8].copy_from_slice(salt);
+    salt_block[8..12].copy_from_slice(&1u32.to_be_bytes());
+
+    let mut mac = HmacSha512::new_from_slice(mnemonic).expect("HMAC accepts any key length");
+    mac.update(&salt_block);
+    let u = mac.finalize().into_bytes();
+    let mut u_prev = [0u8; 64];
+    u_prev.copy_from_slice(&u);
+    dk.copy_from_slice(&u);
+
+    // Subsequent rounds: U_i = PRF(password, U_{i-1}), dk ^= U_i
+    for _ in 1..rounds {
+        let mut mac = HmacSha512::new_from_slice(mnemonic).expect("HMAC accepts any key length");
+        mac.update(&u_prev);
+        let u = mac.finalize().into_bytes();
+        u_prev.copy_from_slice(&u);
+        for (dk_byte, u_byte) in dk.iter_mut().zip(u.iter()) {
+            *dk_byte ^= u_byte;
+        }
+    }
+
+    Seed::from_bytes(&dk)
+}
+
+/// Generate a 24-word BIP39 mnemonic from 256 bits of entropy.
+///
+/// Returns the word list and the derived seed. The entropy is zeroized
+/// after use.
+///
+/// # Security
+///
+/// The caller must provide 32 bytes of cryptographically secure entropy
+/// (from the hardware TRNG on Baochip-1x).
+pub fn generate_mnemonic(entropy: &mut [u8; 32]) -> Result<(Vec<String>, Seed), EthAppError> {
+    use bip39_utils::bytes_to_bip39;
+
+    let entropy_vec = entropy.to_vec();
+
+    // Convert entropy to 24 BIP39 words (bytes_to_bip39 handles SHA-256
+    // checksum computation internally)
+    let words = bytes_to_bip39(&entropy_vec)
+        .map_err(|_| EthAppError::CryptoError)?;
+
+    // Derive seed from the mnemonic words via PBKDF2-HMAC-SHA512
+    let mnemonic_str = words.join(" ");
+    let seed = seed_from_mnemonic(mnemonic_str.as_bytes());
+
+    // Zeroize entropy
+    entropy.zeroize();
+
+    Ok((words, seed))
 }
 
 /// Derive a private key from seed using BIP32/BIP44 path.
@@ -435,6 +503,84 @@ pub fn sign_hash_recoverable(
     Ok((sig, recid))
 }
 
+// =============================================================================
+// bao-seed integration helpers
+// =============================================================================
+//
+// These split the hash-construction step from the signing step so the
+// signing primitive can move to bao-seed while ethapp keeps protocol-
+// specific (EIP-155, EIP-191, EIP-712) hashing local. The signing
+// functions further below (`sign_eth`, `sign_personal_message`,
+// `sign_eip712`) are retained for now for unit tests and legacy
+// hosted-mode entry points; production paths use the helpers below.
+
+/// Compute the EIP-191 personal-message digest. Caller signs this hash
+/// (via bao-seed) and uses `compose_personal_message_signature` to
+/// build the final `Signature` envelope.
+pub fn eth_personal_message_hash(message: &[u8]) -> Hash256 {
+    let prefix = b"\x19Ethereum Signed Message:\n";
+    let len_str = message.len().to_string();
+    let mut prefixed = Vec::with_capacity(prefix.len() + len_str.len() + message.len());
+    prefixed.extend_from_slice(prefix);
+    prefixed.extend_from_slice(len_str.as_bytes());
+    prefixed.extend_from_slice(message);
+    keccak256(&prefixed)
+}
+
+/// Compute the EIP-712 signing hash: keccak256(0x19 || 0x01 ||
+/// domainSeparator || hashStruct(message)).
+pub fn eip712_signing_hash(domain_hash: &Hash256, message_hash: &Hash256) -> Hash256 {
+    let mut data = Vec::with_capacity(66);
+    data.push(0x19);
+    data.push(0x01);
+    data.extend_from_slice(domain_hash);
+    data.extend_from_slice(message_hash);
+    keccak256(&data)
+}
+
+/// Build a transaction Signature from a bao-seed raw signature plus
+/// the Ethereum chain-id / tx-type context. Computes the appropriate
+/// `v` value per EIP-155 / EIP-2930 / EIP-1559 rules.
+pub fn compose_eth_signature(
+    raw: bao_seed_common::Secp256k1Signature,
+    chain_id: Option<u64>,
+    tx_type: TransactionType,
+) -> Result<Signature, EthAppError> {
+    let v = compute_v(raw.recovery_id, chain_id, tx_type)?;
+    Ok(Signature { v, r: raw.r, s: raw.s })
+}
+
+/// Build an EIP-191 Signature: v = 27 + recovery_id.
+pub fn compose_personal_message_signature(
+    raw: bao_seed_common::Secp256k1Signature,
+) -> Signature {
+    Signature { v: 27u64 + raw.recovery_id as u64, r: raw.r, s: raw.s }
+}
+
+/// Build an EIP-712 Signature: same v-convention as personal message.
+pub fn compose_eip712_signature(raw: bao_seed_common::Secp256k1Signature) -> Signature {
+    Signature { v: 27u64 + raw.recovery_id as u64, r: raw.r, s: raw.s }
+}
+
+/// Get the Ethereum address from a compressed SEC1 public key (33 bytes).
+///
+/// Used after `bao_seed.secp256k1_get_pubkey(path)` to derive the
+/// human-readable address without ever materialising a private key in
+/// ethapp.
+pub fn address_from_compressed_pubkey(pubkey: &[u8; 33]) -> Result<EthAddress, EthAppError> {
+    let vk = k256::ecdsa::VerifyingKey::from_sec1_bytes(pubkey)
+        .map_err(|_| EthAppError::KeyDerivationFailed)?;
+    let uncompressed = vk.to_encoded_point(false);
+    let bytes = uncompressed.as_bytes();
+    if bytes.len() != 65 {
+        return Err(EthAppError::KeyDerivationFailed);
+    }
+    let hash = keccak256(&bytes[1..]);
+    let mut addr = [0u8; 20];
+    addr.copy_from_slice(&hash[12..]);
+    Ok(addr)
+}
+
 /// Sign a hash and return Ethereum-format signature.
 ///
 /// # Arguments
@@ -534,6 +680,107 @@ pub fn sign_eip712(
         r,
         s,
     })
+}
+
+/// Produce an attestation co-signature over a transaction signature.
+///
+/// The attestation binds to the specific transaction by signing:
+///   keccak256(tx_sign_hash || v_le_bytes || r || s)
+///
+/// Uses simple v = 27 + recovery_id (not EIP-155).
+pub fn attest_transaction_signature(
+    attestation_key: &SigningKey,
+    tx_sign_hash: &Hash256,
+    tx_sig: &Signature,
+) -> Result<Signature, EthAppError> {
+    let mut message = Vec::with_capacity(32 + 8 + 32 + 32);
+    message.extend_from_slice(tx_sign_hash);
+    message.extend_from_slice(&tx_sig.v.to_le_bytes());
+    message.extend_from_slice(&tx_sig.r);
+    message.extend_from_slice(&tx_sig.s);
+
+    let hash = keccak256(&message);
+
+    let (sig, recid) = sign_hash_recoverable(attestation_key, &hash)?;
+
+    let r_bytes = sig.r().to_bytes();
+    let s_bytes = sig.s().to_bytes();
+
+    let mut r = [0u8; 32];
+    let mut s = [0u8; 32];
+    r.copy_from_slice(&r_bytes);
+    s.copy_from_slice(&s_bytes);
+
+    Ok(Signature {
+        v: 27u64 + recid.to_byte() as u64,
+        r,
+        s,
+    })
+}
+
+// =============================================================================
+// ECIES Encrypted Import
+// =============================================================================
+
+/// ECIES protocol version salt for domain separation.
+const ECIES_SALT: &[u8] = b"ethapp-import-v1";
+
+/// Decrypt an ECIES-encrypted mnemonic payload.
+///
+/// Wire format: `[e_pub: 33 bytes compressed][ciphertext + poly1305 tag: N bytes]`
+///
+/// Protocol:
+/// 1. Parse ephemeral public key (first 33 bytes)
+/// 2. ECDH: shared = diffie_hellman(import_priv, e_pub)
+/// 3. HKDF-SHA256: key = hkdf(shared, salt="ethapp-import-v1")
+/// 4. Nonce: sha256(e_pub_bytes)[..12]
+/// 5. ChaCha20-Poly1305 decrypt + verify tag
+pub fn ecies_decrypt(
+    import_key: &SigningKey,
+    payload: &[u8],
+) -> Result<Vec<u8>, EthAppError> {
+    use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::Aead};
+    use hkdf::Hkdf;
+    use sha2::Digest;
+
+    // Minimum: 33-byte ephemeral pubkey + 16-byte poly1305 tag
+    if payload.len() < 33 + 16 {
+        return Err(EthAppError::InvalidData);
+    }
+
+    // 1. Parse ephemeral public key
+    let e_pub_bytes = &payload[..33];
+    let e_pub = k256::PublicKey::from_sec1_bytes(e_pub_bytes)
+        .map_err(|_| EthAppError::CryptoError)?;
+
+    // 2. ECDH shared secret
+    let shared_secret = k256::ecdh::diffie_hellman(
+        import_key.as_nonzero_scalar(),
+        e_pub.as_affine(),
+    );
+
+    // 3. HKDF-SHA256 to derive symmetric key
+    let hk = Hkdf::<sha2::Sha256>::new(Some(ECIES_SALT), shared_secret.raw_secret_bytes());
+    let mut key = [0u8; 32];
+    hk.expand(b"", &mut key)
+        .map_err(|_| EthAppError::CryptoError)?;
+
+    // 4. Nonce: first 12 bytes of SHA-256(e_pub_bytes)
+    let hash = sha2::Sha256::digest(e_pub_bytes);
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(&hash[..12]);
+
+    // 5. ChaCha20-Poly1305 decrypt
+    let cipher = ChaCha20Poly1305::new((&key).into());
+    let ciphertext_and_tag = &payload[33..];
+    let plaintext = cipher.decrypt((&nonce).into(), ciphertext_and_tag)
+        .map_err(|_| EthAppError::DecryptionFailed)?;
+
+    // Zeroize key material
+    zeroize::Zeroize::zeroize(&mut key);
+    zeroize::Zeroize::zeroize(&mut nonce);
+
+    Ok(plaintext)
 }
 
 // =============================================================================

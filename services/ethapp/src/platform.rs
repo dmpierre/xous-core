@@ -27,11 +27,6 @@
 //! - xous-core services/trng/src/lib.rs: Trng::new(), fill_bytes(), CryptoRng impl
 //! - xous-core services/pddb/src/lib.rs: Pddb::new(), get(), key read/write
 
-#[cfg(target_os = "xous")]
-use alloc::string::String;
-#[cfg(target_os = "xous")]
-use alloc::vec::Vec;
-
 use ethapp_common::EthAppError;
 
 /// PDDB dictionary name for all ethapp keys.
@@ -42,6 +37,12 @@ pub const PDDB_DICT: &str = "ethapp.ethereum";
 
 /// PDDB key name for the encrypted master seed.
 pub const PDDB_KEY_SEED: &str = "master_seed";
+
+/// PDDB key name for the attestation private key (32 bytes, secp256k1 scalar).
+pub const PDDB_KEY_ATTESTATION: &str = "attestation_key";
+
+/// PDDB key name for the import private key (32 bytes, secp256k1 scalar for ECIES).
+pub const PDDB_KEY_IMPORT: &str = "import_key";
 
 /// Platform abstraction trait.
 ///
@@ -87,131 +88,83 @@ pub trait Platform {
 // Xous Platform Implementation
 // =============================================================================
 
-#[cfg(target_os = "xous")]
+#[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
 pub struct XousPlatform {
-    /// Connection to the Xous TRNG service.
-    ///
-    /// The `trng::Trng` struct owns a CID to the TRNG server and
-    /// implements `rand_core::RngCore + CryptoRng`. It uses hardware
-    /// entropy from the BAO1X2S4F TRNG block, whitened through a
-    /// ChaCha-based CSPRNG with online health monitoring.
-    ///
-    /// `None` until `init()` is called successfully.
+    /// Connection to the Xous TRNG service (native Xous only).
+    #[cfg(target_os = "xous")]
     trng: Option<trng::Trng>,
-    // TODO(baochip): Add PDDB connection when pddb crate is available
-    // in the Baochip Xous build. The Pddb struct owns a CID to the
-    // PDDB server and provides encrypted key-value storage.
-    //
-    // pddb: Option<pddb::Pddb>,
-    //
-    // TODO(baochip): Add GAM connection for secure UI
-    // gam: Option<gam::Gam>,
+    /// Connection to the PDDB for persistent storage.
+    #[cfg(feature = "pddb")]
+    pddb: Option<pddb::Pddb>,
+    /// Hosted mode doesn't have the trng crate — uses getrandom instead.
+    #[cfg(not(target_os = "xous"))]
+    _initialized: bool,
 }
 
-#[cfg(target_os = "xous")]
+#[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
 impl XousPlatform {
-    /// Create a new platform instance.
-    ///
-    /// Services are not connected until `init()` is called. This two-phase
-    /// initialization allows the caller to handle connection failures
-    /// gracefully rather than panicking in the constructor.
     pub fn new() -> Self {
         Self {
+            #[cfg(target_os = "xous")]
             trng: None,
+            #[cfg(feature = "pddb")]
+            pddb: None,
+            #[cfg(not(target_os = "xous"))]
+            _initialized: false,
         }
     }
 
-    /// Initialize connections to Xous services.
-    ///
-    /// Connects to the TRNG service (and eventually PDDB, GAM). Must be
-    /// called before any platform operations. Fails closed: if the TRNG
-    /// service is unreachable, all signing operations will fail.
     pub fn init(&mut self) -> Result<(), EthAppError> {
-        let xns = xous_names::XousNames::new()
-            .map_err(|_| EthAppError::ServiceConnectionFailed)?;
+        #[cfg(target_os = "xous")]
+        {
+            let xns = xous_names::XousNames::new()
+                .map_err(|_| EthAppError::ServiceConnectionFailed)?;
+            let trng = trng::Trng::new(&xns)
+                .map_err(|_| EthAppError::ServiceConnectionFailed)?;
+            self.trng = Some(trng);
 
-        // Connect to the hardware TRNG service.
-        // trng::Trng::new() calls xns.request_connection_blocking(SERVER_NAME_TRNG)
-        // internally. On failure, we propagate ServiceConnectionFailed so that
-        // the caller knows the platform is not usable for cryptographic operations.
-        let trng = trng::Trng::new(&xns)
-            .map_err(|_| EthAppError::ServiceConnectionFailed)?;
-        self.trng = Some(trng);
+            // Connect to PDDB for persistent storage
+            #[cfg(feature = "pddb")]
+            match pddb::Pddb::new() {
+                Ok(db) => {
+                    self.pddb = Some(db);
+                    log::info!("Platform: PDDB connected");
+                }
+                Err(e) => {
+                    log::warn!("Platform: PDDB connection failed: {:?} (storage unavailable)", e);
+                }
+            }
+        }
 
-        // TODO(baochip): Connect to PDDB service
-        // let pddb = pddb::Pddb::new();
-        // pddb.is_mounted_blocking(); // wait for PDDB to be ready
-        // self.pddb = Some(pddb);
+        #[cfg(not(target_os = "xous"))]
+        {
+            self._initialized = true;
+        }
 
-        // TODO(baochip): Connect to GAM service for secure display
-        // self.gam = Some(gam::Gam::new(&xns).map_err(|_| EthAppError::ServiceConnectionFailed)?);
-
-        log::info!("Platform: Initialized Xous services (TRNG connected)");
+        log::info!("Platform: Initialized");
         Ok(())
     }
 }
 
-#[cfg(target_os = "xous")]
+#[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
 impl Platform for XousPlatform {
     fn rng_fill_bytes(&self, buf: &mut [u8]) -> Result<(), EthAppError> {
-        // Dev-mode: deterministic fake RNG for reproducible testing.
-        // SECURITY: This is NOT cryptographically secure and must never
-        // be used in production. The cfg(feature) gate ensures it is
-        // compile-time excluded from release builds.
-        #[cfg(feature = "dev-mode")]
+        #[cfg(target_os = "xous")]
         {
-            // Deterministic test seed -- INSECURE, for development only.
-            let seed: u64 = u64::from_le_bytes([0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE]);
-
-            let mut state = seed;
-            for byte in buf.iter_mut() {
-                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-                *byte = (state >> 32) as u8;
-            }
-            return Ok(());
-        }
-
-        #[cfg(not(feature = "dev-mode"))]
-        {
+            // On real hardware: always use the hardware TRNG, even in dev-mode.
             use rand_core::RngCore;
-
-            // Access the TRNG service. Fail closed if not initialized.
             let trng = self.trng.as_ref()
                 .ok_or(EthAppError::ServiceConnectionFailed)?;
-
-            // trng::Trng implements RngCore + CryptoRng.
-            // fill_bytes() dispatches to the hardware TRNG:
-            //   - For buffers < 64 bytes: uses get_u64() scalar calls
-            //   - For larger buffers: uses fill_buf() with IPC memory messages
-            //
-            // The TRNG service provides CSPRNG-quality output:
-            //   1. Hardware entropy from ring oscillator + avalanche noise
-            //   2. ChaCha whitener in the always-on domain
-            //   3. NIST SP 800-90B online health monitoring
-            //
-            // Note: fill_bytes() takes &mut self on the RngCore trait, but the
-            // underlying Xous IPC is stateless (each call is an independent
-            // message to the TRNG server). We use a shared reference and
-            // reborrow mutably here because the Trng struct's mutable state
-            // is only the connection ID (which doesn't change after init).
-            //
-            // SAFETY: This requires interior mutability in the Trng struct.
-            // The upstream trng::Trng implementation uses message-passing
-            // which is inherently thread-safe in Xous. If the upstream API
-            // changes to require &mut self without interior mutability, this
-            // will need adjustment (e.g., wrapping in a Mutex or Cell).
-            //
-            // For now, we cast through a raw pointer. This is sound because:
-            // - The Xous message-passing IPC is stateless per-call
-            // - The CID field is read-only after initialization
-            // - No other thread accesses this Trng instance concurrently
-            //   (XousPlatform is not Send/Sync, single-threaded server loop)
+            // SAFETY: Single-threaded Xous server; Trng IPC is stateless.
             let trng_ptr = trng as *const trng::Trng as *mut trng::Trng;
-            // SAFETY: Single-threaded Xous server; no concurrent access.
-            // The Trng::fill_bytes only reads conn (CID) and sends IPC messages.
             unsafe { (*trng_ptr).fill_bytes(buf); }
-
             Ok(())
+        }
+
+        #[cfg(not(target_os = "xous"))]
+        {
+            // Hosted mode: use getrandom for OS entropy
+            getrandom::getrandom(buf).map_err(|_| EthAppError::CryptoError)
         }
     }
 
@@ -244,7 +197,7 @@ impl Platform for XousPlatform {
     fn show_transaction_review(
         &self,
         fields: &[(&str, &str)],
-        action: &str,
+        _action: &str,
     ) -> Result<bool, EthAppError> {
         // TODO(baochip): Use GAM ReviewScreen for secure transaction display.
 
@@ -276,87 +229,94 @@ impl Platform for XousPlatform {
     }
 
     fn store_value(&self, key: &str, value: &[u8]) -> Result<(), EthAppError> {
-        // TODO(baochip): Use PDDB to store value.
-        //
-        // The PDDB provides encrypted, plausibly-deniable storage with
-        // basis-level access control. Keys are stored under the "ethapp.ethereum"
-        // dictionary. The PDDB automatically encrypts data at rest.
-        //
-        // Implementation pattern (from xous-core services/pddb/src/lib.rs):
-        //
-        //   let pddb = self.pddb.as_ref()
-        //       .ok_or(EthAppError::ServiceConnectionFailed)?;
-        //   let mut key_handle = pddb.get(
-        //       PDDB_DICT,          // dictionary name
-        //       key,                // key name
-        //       None,               // default basis
-        //       true,               // create if not exists
-        //       true,               // alloc on create
-        //       Some(value.len()),  // size hint
-        //       None::<fn()>,       // no change callback
-        //   ).map_err(|_| EthAppError::StorageError)?;
-        //   use std::io::Write;
-        //   key_handle.write_all(value)
-        //       .map_err(|_| EthAppError::StorageError)?;
-        //   pddb.sync().map_err(|_| EthAppError::StorageError)?;
-
-        log::info!("Platform: Would store {} bytes to key '{}'", value.len(), key);
-        #[cfg(feature = "dev-mode")]
+        #[cfg(feature = "pddb")]
         {
+            let pddb = self.pddb.as_ref()
+                .ok_or(EthAppError::ServiceConnectionFailed)?;
+            let mut key_handle = pddb.get(
+                PDDB_DICT,
+                key,
+                None,
+                true,
+                true,
+                Some(value.len()),
+                None::<fn()>,
+            ).map_err(|_| EthAppError::StorageError)?;
+            use std::io::Write;
+            key_handle.write_all(value)
+                .map_err(|_| EthAppError::StorageError)?;
+            pddb.sync().map_err(|_| EthAppError::StorageError)?;
+            log::info!("Platform: Stored {} bytes to key '{}'", value.len(), key);
             Ok(())
         }
-        #[cfg(not(feature = "dev-mode"))]
+
+        #[cfg(not(feature = "pddb"))]
         {
-            // Fail closed: without PDDB connection, storage is unavailable.
-            Err(EthAppError::StorageError)
+            log::info!("Platform: Would store {} bytes to key '{}'", value.len(), key);
+            #[cfg(feature = "dev-mode")]
+            { Ok(()) }
+            #[cfg(not(feature = "dev-mode"))]
+            { Err(EthAppError::StorageError) }
         }
     }
 
     fn load_value(&self, key: &str) -> Result<Option<Vec<u8>>, EthAppError> {
-        // TODO(baochip): Use PDDB to load value.
-        //
-        // Implementation pattern:
-        //
-        //   let pddb = self.pddb.as_ref()
-        //       .ok_or(EthAppError::ServiceConnectionFailed)?;
-        //   match pddb.get(
-        //       PDDB_DICT,         // dictionary name
-        //       key,               // key name
-        //       None,              // default basis
-        //       false,             // do not create
-        //       false,             // no alloc
-        //       None,              // no size hint
-        //       None::<fn()>,      // no change callback
-        //   ) {
-        //       Ok(mut handle) => {
-        //           use std::io::Read;
-        //           let mut data = Vec::new();
-        //           handle.read_to_end(&mut data)
-        //               .map_err(|_| EthAppError::StorageError)?;
-        //           Ok(Some(data))
-        //       }
-        //       Err(_) => Ok(None), // key not found
-        //   }
+        #[cfg(feature = "pddb")]
+        {
+            let pddb = match self.pddb.as_ref() {
+                Some(p) => p,
+                None => return Ok(None),
+            };
+            match pddb.get(
+                PDDB_DICT,
+                key,
+                None,
+                false,
+                false,
+                None,
+                None::<fn()>,
+            ) {
+                Ok(mut handle) => {
+                    use std::io::Read;
+                    let mut data = Vec::new();
+                    handle.read_to_end(&mut data)
+                        .map_err(|_| EthAppError::StorageError)?;
+                    log::info!("Platform: Loaded {} bytes from key '{}'", data.len(), key);
+                    Ok(Some(data))
+                }
+                Err(_) => Ok(None),
+            }
+        }
 
-        log::info!("Platform: Would load from key '{}'", key);
-        Ok(None)
+        #[cfg(not(feature = "pddb"))]
+        {
+            log::info!("Platform: Would load from key '{}'", key);
+            Ok(None)
+        }
     }
 
     fn delete_value(&self, key: &str) -> Result<(), EthAppError> {
-        // TODO(baochip): Use PDDB to delete value.
-        //
-        //   let pddb = self.pddb.as_ref()
-        //       .ok_or(EthAppError::ServiceConnectionFailed)?;
-        //   pddb.delete_key(PDDB_DICT, key, None)
-        //       .map_err(|_| EthAppError::StorageError)?;
-        //   pddb.sync().map_err(|_| EthAppError::StorageError)?;
+        #[cfg(feature = "pddb")]
+        {
+            let pddb = match self.pddb.as_ref() {
+                Some(p) => p,
+                None => return Ok(()),
+            };
+            pddb.delete_key(PDDB_DICT, key, None)
+                .map_err(|_| EthAppError::StorageError)?;
+            pddb.sync().map_err(|_| EthAppError::StorageError)?;
+            log::info!("Platform: Deleted key '{}'", key);
+        }
 
-        log::info!("Platform: Would delete key '{}'", key);
+        #[cfg(not(feature = "pddb"))]
+        {
+            log::info!("Platform: Would delete key '{}'", key);
+        }
         Ok(())
     }
 }
 
-#[cfg(target_os = "xous")]
+#[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
 impl Default for XousPlatform {
     fn default() -> Self {
         Self::new()
@@ -367,21 +327,21 @@ impl Default for XousPlatform {
 // Mock Platform (for host testing)
 // =============================================================================
 
-#[cfg(not(target_os = "xous"))]
+#[cfg(not(any(target_os = "xous", feature = "hosted-dabao")))]
 use std::collections::HashMap;
-#[cfg(not(target_os = "xous"))]
+#[cfg(not(any(target_os = "xous", feature = "hosted-dabao")))]
 use std::sync::Mutex;
-#[cfg(not(target_os = "xous"))]
+#[cfg(not(any(target_os = "xous", feature = "hosted-dabao")))]
 use std::vec::Vec;
 
 /// Mock platform for host-side testing.
-#[cfg(not(target_os = "xous"))]
+#[cfg(not(any(target_os = "xous", feature = "hosted-dabao")))]
 pub struct MockPlatform {
     storage: Mutex<HashMap<String, Vec<u8>>>,
     auto_approve: bool,
 }
 
-#[cfg(not(target_os = "xous"))]
+#[cfg(not(any(target_os = "xous", feature = "hosted-dabao")))]
 impl MockPlatform {
     /// Create a new mock platform.
     pub fn new() -> Self {
@@ -402,7 +362,7 @@ impl MockPlatform {
     }
 }
 
-#[cfg(not(target_os = "xous"))]
+#[cfg(not(any(target_os = "xous", feature = "hosted-dabao")))]
 impl Platform for MockPlatform {
     fn rng_fill_bytes(&self, buf: &mut [u8]) -> Result<(), EthAppError> {
         // Use getrandom for host testing
@@ -449,7 +409,7 @@ impl Platform for MockPlatform {
     }
 }
 
-#[cfg(not(target_os = "xous"))]
+#[cfg(not(any(target_os = "xous", feature = "hosted-dabao")))]
 impl Default for MockPlatform {
     fn default() -> Self {
         Self::new()
@@ -461,7 +421,7 @@ mod tests {
     use super::*;
 
     #[test]
-    #[cfg(not(target_os = "xous"))]
+    #[cfg(not(any(target_os = "xous", feature = "hosted-dabao")))]
     fn test_mock_platform_storage() {
         let platform = MockPlatform::new();
 
@@ -479,7 +439,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_os = "xous"))]
+    #[cfg(not(any(target_os = "xous", feature = "hosted-dabao")))]
     fn test_mock_platform_rng() {
         let platform = MockPlatform::new();
         let mut buf1 = [0u8; 32];
@@ -495,7 +455,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_os = "xous"))]
+    #[cfg(not(any(target_os = "xous", feature = "hosted-dabao")))]
     fn test_mock_platform_rng_fills_full_buffer() {
         let platform = MockPlatform::new();
 
@@ -510,7 +470,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_os = "xous"))]
+    #[cfg(not(any(target_os = "xous", feature = "hosted-dabao")))]
     fn test_pddb_constants() {
         // Verify PDDB dictionary and key names are reasonable
         assert!(!PDDB_DICT.is_empty());

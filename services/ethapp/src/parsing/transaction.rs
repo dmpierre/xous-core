@@ -13,15 +13,11 @@
 //! - Fail closed on any ambiguity
 //! - Compute correct hash for signing
 
-#[cfg(target_os = "xous")]
-use alloc::vec::Vec;
-
-#[cfg(not(target_os = "xous"))]
 use std::vec::Vec;
 
 use ethapp_common::{EthAddress, Hash256, TransactionType, MAX_TX_SIZE};
 
-use super::rlp::{self, RlpError, RlpItem};
+use ethapp_common::rlp::{self, RlpError, RlpItem};
 use crate::crypto::keccak256;
 
 /// Transaction parsing errors.

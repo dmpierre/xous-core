@@ -7,28 +7,17 @@
 //! - Performing the operation
 //! - Serializing and returning the response
 
-#[cfg(target_os = "xous")]
-use alloc::string::String;
-#[cfg(target_os = "xous")]
-use alloc::vec::Vec;
-
-#[cfg(not(target_os = "xous"))]
 use std::string::String;
-#[cfg(not(target_os = "xous"))]
-use std::vec::Vec;
 
 use ethapp_common::{
-    AppConfiguration, Bip32Path, EthAppError, Hash256, ProvideTokenInfoRequest,
+    AttestedSignature, Bip32Path, EthAppError, InitAttestationRequest,
+    AttestationKeyResponse, MetadataContext, ProvideTokenInfoRequest,
     PublicKeyResponse, Signature, SignEip712HashedRequest, SignEip712MessageRequest,
-    SignPersonalMessageRequest, SignTransactionRequest, TransactionType,
+    SignPersonalMessageRequest, SignTransactionRequest,
 };
-use rkyv::{Deserialize, Serialize};
 
-use crate::crypto::{
-    derive_private_key, format_address_checksummed, get_compressed_pubkey, keccak256,
-    public_key_to_address, sign_eth, sign_eip712, sign_personal_message, get_public_key,
-};
-use crate::parsing::{ParsedTransaction, TransactionParser};
+use crate::crypto::{attest_transaction_signature, get_compressed_pubkey};
+use crate::parsing::TransactionParser;
 use crate::platform::Platform;
 use crate::state::ServiceState;
 use crate::ui;
@@ -38,53 +27,77 @@ use crate::ui;
 // =============================================================================
 
 /// Returns a success scalar response.
-#[cfg(target_os = "xous")]
+#[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
 pub fn return_success(msg: xous::MessageEnvelope) -> Result<(), EthAppError> {
     xous::return_scalar(msg.sender, 0)
         .map_err(|_| EthAppError::InternalError)
 }
 
-#[cfg(not(target_os = "xous"))]
+#[cfg(not(any(target_os = "xous", feature = "hosted-dabao")))]
 pub fn return_success(_msg: ()) -> Result<(), EthAppError> {
     Ok(())
 }
 
 /// Returns an error scalar response.
-#[cfg(target_os = "xous")]
+#[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
 pub fn return_error(msg: xous::MessageEnvelope, error: EthAppError) -> Result<(), EthAppError> {
     xous::return_scalar(msg.sender, error.code() as usize)
         .map_err(|_| EthAppError::InternalError)
 }
 
-#[cfg(not(target_os = "xous"))]
+#[cfg(not(any(target_os = "xous", feature = "hosted-dabao")))]
 pub fn return_error(_msg: (), error: EthAppError) -> Result<(), EthAppError> {
     Err(error)
 }
 
-/// Safely extract a Buffer from a Xous memory message.
+/// Write an error code into the response buffer so the client can detect it.
 ///
-/// Encapsulates the single `unsafe` call to `Buffer::from_memory_message`,
-/// validating the message type first. This is the only place in the codebase
-/// where this unsafe operation occurs.
+/// Encodes `error.code()` as a `u32` (4 bytes).  The client distinguishes
+/// this from normal responses by checking `buf.used() == 4`: valid responses
+/// are either 1 byte (u8 bool) or ≥ 20 bytes (addresses, signatures, etc.).
+/// Error codes are 0x00–0x1A, so a 4-byte response is unambiguously an error.
+#[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
+fn write_error_response(buffer: &mut xous_ipc::Buffer, error: EthAppError) {
+    let _ = buffer.replace(error.code() as u32);
+}
+
+
+/// Returns true for Ethereum mainnet and major L2 chain IDs where
+/// real funds are at risk. Used to block signing on displayless boards
+/// (dev-mode/autoapprove builds) that lack a trusted display.
+#[cfg(any(feature = "autoapprove", feature = "dev-mode"))]
+fn is_mainnet_chain(chain_id: u64) -> bool {
+    matches!(
+        chain_id,
+        1          // Ethereum mainnet
+        | 10       // Optimism
+        | 56       // BSC
+        | 100      // Gnosis
+        | 137      // Polygon PoS
+        | 250      // Fantom
+        | 324      // zkSync Era
+        | 8453     // Base
+        | 42161    // Arbitrum One
+        | 42170    // Arbitrum Nova
+        | 43114    // Avalanche C-Chain
+        | 59144    // Linea
+        | 534352   // Scroll
+    )
+}
+
+/// Map a `bao-seed-api` ApiError onto an `EthAppError`.
 ///
-/// # Safety justification
-/// `Buffer::from_memory_message` is unsafe because it constructs a Buffer from
-/// a raw kernel-provided memory region. The safety is ensured by:
-/// - The Xous kernel guarantees valid memory mapping for Borrow/MutableBorrow messages
-/// - We validate the message type before calling the unsafe function
-/// - The Buffer lifetime is bounded by the message lifetime
-#[cfg(target_os = "xous")]
-fn extract_buffer(msg: &xous::MessageEnvelope) -> Result<xous_ipc::Buffer, EthAppError> {
-    use xous::Message;
-    use xous_ipc::Buffer;
-    match &msg.body {
-        Message::MutableBorrow(b) | Message::Borrow(b) => {
-            // SAFETY: The Xous kernel guarantees that Borrow/MutableBorrow messages
-            // contain valid memory regions mapped into our address space.
-            unsafe { Buffer::from_memory_message(b) }
-                .map_err(|_| EthAppError::InvalidData)
+/// `BaoSeedError::NoSeed` deserves its own slot in ethapp's wire vocabulary
+/// (it maps to `STATUS_ERR_NO_SEED` on serial — semantic, not an
+/// internal-error catch-all). Other bao-seed failures fall back to
+/// `KeyDerivationFailed`.
+#[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
+fn map_bao_seed_err(e: bao_seed_api::ApiError) -> EthAppError {
+    match e {
+        bao_seed_api::ApiError::Service(bao_seed_api::BaoSeedError::NoSeed) => {
+            EthAppError::UnsupportedOperation
         }
-        _ => Err(EthAppError::InvalidData),
+        _ => EthAppError::KeyDerivationFailed,
     }
 }
 
@@ -92,69 +105,31 @@ fn extract_buffer(msg: &xous::MessageEnvelope) -> Result<xous_ipc::Buffer, EthAp
 ///
 /// Both dev-mode and production paths return the same type to prevent
 /// compilation errors where callers use `?` for one cfg but not the other.
-#[cfg(feature = "dev-mode")]
-fn get_seed() -> Result<crate::crypto::Seed, EthAppError> {
-    Ok(crate::crypto::get_dev_seed())
-}
+///
+/// Get the seed for key derivation. Host-only — real-target signing
+/// paths route through bao-seed and never call this. Retained for
+/// host-test code that exercises `crate::crypto::*` directly without
+/// spinning up an IPC service.
+#[cfg(not(any(target_os = "xous", feature = "hosted-dabao")))]
+#[allow(dead_code)]
+fn get_seed(state: &ServiceState) -> Result<crate::crypto::Seed, EthAppError> {
+    // Check for runtime-imported seed first
+    if let Some(seed) = &state.imported_seed {
+        return Ok(seed.clone());
+    }
 
-#[cfg(not(feature = "dev-mode"))]
-fn get_seed() -> Result<crate::crypto::Seed, EthAppError> {
-    // Production seed loading via PDDB secure storage.
-    //
-    // The master seed is stored encrypted in the PDDB under the
-    // "ethapp.ethereum" dictionary with key "master_seed". The PDDB
-    // provides plausible deniability through its basis system and
-    // encrypts all data at rest.
-    //
-    // # Security Model
-    //
-    // - The seed is derived during device initialization from the user's
-    //   BIP39 mnemonic and stored in PDDB under PIN/password protection.
-    // - The PDDB basis must be unlocked (user authenticated) before the
-    //   seed can be read. If the basis is locked, this returns an error.
-    // - The seed bytes are validated for length (exactly 64 bytes) before
-    //   constructing the Seed type. This prevents truncation attacks.
-    // - On the Baochip-1x, the PDDB encryption key is derived from the
-    //   device root key stored in the hardware keystore (efuse-protected).
-    //
-    // # Docs consulted
-    //
-    // - xous-core services/pddb/src/lib.rs: Pddb::get() API
-    // - platform.rs: PDDB_DICT, PDDB_KEY_SEED constants
-    //
-    // TODO(baochip): Implement actual PDDB read when pddb crate is
-    // available in the Baochip Xous build. The implementation will be:
-    //
-    //   let pddb = pddb::Pddb::new();
-    //   pddb.is_mounted_blocking(); // ensure PDDB is ready
-    //   let mut handle = pddb.get(
-    //       crate::platform::PDDB_DICT,
-    //       crate::platform::PDDB_KEY_SEED,
-    //       None,               // default basis (user's unlocked basis)
-    //       false,              // do not create if missing
-    //       false,              // no alloc
-    //       None,               // no size hint
-    //       None::<fn()>,       // no change callback
-    //   ).map_err(|_| EthAppError::StorageError)?;
-    //
-    //   use std::io::Read;
-    //   let mut seed_bytes = [0u8; 64];
-    //   let bytes_read = handle.read(&mut seed_bytes)
-    //       .map_err(|_| EthAppError::StorageError)?;
-    //   if bytes_read != 64 {
-    //       // Truncated or corrupt seed -- fail closed.
-    //       seed_bytes.zeroize();
-    //       return Err(EthAppError::StorageError);
-    //   }
-    //
-    //   // Alternatively, for Baochip-1x: the 256-bit Backup Register
-    //   // could hold a master secret that is KDF'd into the full seed.
-    //   // This would require: backup_reg_read() -> HKDF-SHA256 -> 64-byte seed
-    //
-    //   Ok(crate::crypto::Seed::from_bytes(&seed_bytes))
-    //
-    // Until PDDB is integrated, fail closed.
-    Err(EthAppError::UnsupportedOperation)
+    // Fall back to dev seed or error
+    #[cfg(feature = "dev-mode")]
+    {
+        let _ = state;
+        return Ok(crate::crypto::get_dev_seed());
+    }
+
+    #[cfg(not(feature = "dev-mode"))]
+    {
+        let _ = state;
+        Err(EthAppError::UnsupportedOperation)
+    }
 }
 
 // =============================================================================
@@ -162,30 +137,25 @@ fn get_seed() -> Result<crate::crypto::Seed, EthAppError> {
 // =============================================================================
 
 /// Handle GetAppConfiguration request.
-#[cfg(target_os = "xous")]
+#[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
 pub fn handle_get_app_configuration(
     state: &mut ServiceState,
-    msg: xous::MessageEnvelope,
+    mut msg: xous::MessageEnvelope,
 ) -> Result<(), EthAppError> {
     use xous_ipc::Buffer;
 
+    let mut buffer = unsafe {
+        Buffer::from_memory_message_mut(
+            msg.body.memory_message_mut().ok_or(EthAppError::InvalidData)?,
+        )
+    };
+
     let config = state.config.clone();
-
-    // Serialize response
-    let bytes = rkyv::to_bytes::<_, 256>(&config)
-        .map_err(|_| EthAppError::SerializationError)?;
-
-    // Return via memory message
-    let mut buffer = Buffer::into_buf(bytes.to_vec())
-        .map_err(|_| EthAppError::SerializationError)?;
-
-    buffer.replace(msg.body)
-        .map_err(|_| EthAppError::InternalError)?;
-
+    buffer.replace(config).map_err(|_| EthAppError::InternalError)?;
     Ok(())
 }
 
-#[cfg(not(target_os = "xous"))]
+#[cfg(not(any(target_os = "xous", feature = "hosted-dabao")))]
 pub fn handle_get_app_configuration(
     state: &mut ServiceState,
     _msg: (),
@@ -194,26 +164,26 @@ pub fn handle_get_app_configuration(
 }
 
 /// Handle GetChallenge request.
-#[cfg(target_os = "xous")]
+#[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
 pub fn handle_get_challenge(
     state: &mut ServiceState,
-    msg: xous::MessageEnvelope,
+    mut msg: xous::MessageEnvelope,
 ) -> Result<(), EthAppError> {
     use xous_ipc::Buffer;
 
+    let mut buffer = unsafe {
+        Buffer::from_memory_message_mut(
+            msg.body.memory_message_mut().ok_or(EthAppError::InvalidData)?,
+        )
+    };
+
     let mut challenge = [0u8; 32];
     state.platform.rng_fill_bytes(&mut challenge)?;
-
-    let mut buffer = Buffer::into_buf(challenge.to_vec())
-        .map_err(|_| EthAppError::SerializationError)?;
-
-    buffer.replace(msg.body)
-        .map_err(|_| EthAppError::InternalError)?;
-
+    buffer.replace(challenge).map_err(|_| EthAppError::InternalError)?;
     Ok(())
 }
 
-#[cfg(not(target_os = "xous"))]
+#[cfg(not(any(target_os = "xous", feature = "hosted-dabao")))]
 pub fn handle_get_challenge(
     state: &mut ServiceState,
     _msg: (),
@@ -228,37 +198,34 @@ pub fn handle_get_challenge(
 // =============================================================================
 
 /// Handle SignTransaction request.
-#[cfg(target_os = "xous")]
+#[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
 pub fn handle_sign_transaction(
     state: &mut ServiceState,
-    msg: xous::MessageEnvelope,
+    mut msg: xous::MessageEnvelope,
 ) -> Result<(), EthAppError> {
     use xous_ipc::Buffer;
 
-    // Extract request from memory message
-    let buffer = extract_buffer(&msg)?;
+    let mut buffer = unsafe {
+        Buffer::from_memory_message_mut(
+            msg.body.memory_message_mut().ok_or(EthAppError::InvalidData)?,
+        )
+    };
 
-    let request: SignTransactionRequest = buffer.to_original()
+    let request: SignTransactionRequest = buffer
+        .to_original()
         .map_err(|_| EthAppError::SerializationError)?;
 
-    // Process the signing request
-    let signature = process_sign_transaction(state, &request)?;
-
-    // Serialize and return signature
-    let bytes = rkyv::to_bytes::<_, 128>(&signature)
-        .map_err(|_| EthAppError::SerializationError)?;
-
-    let mut response = Buffer::into_buf(bytes.to_vec())
-        .map_err(|_| EthAppError::SerializationError)?;
-
-    response.replace(msg.body)
-        .map_err(|_| EthAppError::InternalError)?;
-
-    state.record_sign_success();
+    match process_sign_transaction(state, &request) {
+        Ok(signature) => {
+            buffer.replace(signature).map_err(|_| EthAppError::InternalError)?;
+            state.record_sign_success();
+        }
+        Err(e) => write_error_response(&mut buffer, e),
+    }
     Ok(())
 }
 
-#[cfg(not(target_os = "xous"))]
+#[cfg(not(any(target_os = "xous", feature = "hosted-dabao")))]
 pub fn handle_sign_transaction(
     state: &mut ServiceState,
     request: &SignTransactionRequest,
@@ -273,6 +240,16 @@ fn process_sign_transaction(
     state: &mut ServiceState,
     request: &SignTransactionRequest,
 ) -> Result<Signature, EthAppError> {
+    let (signature, _sign_hash) = process_sign_transaction_inner(state, request)?;
+    Ok(signature)
+}
+
+/// Inner sign transaction — returns both the signature and the sign_hash
+/// (the sign_hash is needed by the attestation co-signature flow).
+fn process_sign_transaction_inner(
+    state: &mut ServiceState,
+    request: &SignTransactionRequest,
+) -> Result<(Signature, ethapp_common::Hash256), EthAppError> {
     // Validate path
     if !request.path.is_valid_ethereum_path() {
         return Err(EthAppError::InvalidDerivationPath);
@@ -282,29 +259,54 @@ fn process_sign_transaction(
     let tx = TransactionParser::parse(&request.tx_data)
         .map_err(|_| EthAppError::InvalidTransaction)?;
 
+    // Guard: without a trusted display (autoapprove/dev-mode builds),
+    // refuse to sign on mainnet or major L2s to prevent accidental
+    // real-fund losses on displayless boards like dabao.
+    #[cfg(any(feature = "autoapprove", feature = "dev-mode"))]
+    {
+        if let Some(chain_id) = tx.chain_id {
+            if is_mainnet_chain(chain_id) && !state.dangerous_mainnet {
+                log::error!(
+                    "ethapp: REFUSING to sign on chain {} in dev-mode/autoapprove build (no trusted display). \
+                     Use EnableDangerousMainnet to override at your own risk.",
+                    chain_id,
+                );
+                return Err(EthAppError::UnsupportedOperation);
+            }
+        }
+    }
+
+    // Look up cached token info if this is a contract call to a known token
+    let token_info = match (&tx.to, tx.chain_id) {
+        (Some(addr), Some(cid)) => state.get_token_info(cid, addr).cloned(),
+        _ => None,
+    };
+
     // Display transaction for user confirmation
-    if !ui::display_transaction(&state.platform, &tx, false)? {
+    if !ui::display_transaction(&state.platform, &tx, false, token_info.as_ref())? {
         state.record_sign_rejected();
         return Err(EthAppError::RejectedByUser);
     }
 
-    // Get seed and derive key; sign in a tight scope so the signing key
-    // is dropped (and zeroized via k256's ZeroizeOnDrop) immediately after use.
-    let signature = {
-        let seed = get_seed()?;
-        let signing_key = derive_private_key(&seed, &request.path)?;
-        // seed is Zeroize+Drop, signing_key has ZeroizeOnDrop
-        sign_eth(&signing_key, &tx.sign_hash, tx.chain_id, tx.tx_type)?
-        // signing_key and seed dropped here, secret material zeroized
-    };
+    let sign_hash = tx.sign_hash;
+
+    // Signing now goes through bao-seed (Pattern A — sign-inside-vault).
+    // ethapp ships the (path, hash) pair; bao-seed derives the
+    // secp256k1 key, signs, and returns (r, s, recovery_id). The
+    // chain-id/tx-type-dependent `v` is computed here in ethapp.
+    let path_vec = request.path.components.clone();
+    let raw = state.bao_seed()?
+        .secp256k1_sign(path_vec, sign_hash)
+        .map_err(map_bao_seed_err)?;
+    let signature = crate::crypto::compose_eth_signature(raw, tx.chain_id, tx.tx_type)?;
 
     state.platform.show_info(true, "Transaction signed");
 
-    Ok(signature)
+    Ok((signature, sign_hash))
 }
 
 /// Handle ClearSignTransaction request.
-#[cfg(target_os = "xous")]
+#[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
 pub fn handle_clear_sign_transaction(
     state: &mut ServiceState,
     msg: xous::MessageEnvelope,
@@ -314,7 +316,7 @@ pub fn handle_clear_sign_transaction(
     handle_sign_transaction(state, msg)
 }
 
-#[cfg(not(target_os = "xous"))]
+#[cfg(not(any(target_os = "xous", feature = "hosted-dabao")))]
 pub fn handle_clear_sign_transaction(
     state: &mut ServiceState,
     request: &SignTransactionRequest,
@@ -327,34 +329,34 @@ pub fn handle_clear_sign_transaction(
 // =============================================================================
 
 /// Handle SignPersonalMessage request.
-#[cfg(target_os = "xous")]
+#[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
 pub fn handle_sign_personal_message(
     state: &mut ServiceState,
-    msg: xous::MessageEnvelope,
+    mut msg: xous::MessageEnvelope,
 ) -> Result<(), EthAppError> {
     use xous_ipc::Buffer;
 
-    let buffer = extract_buffer(&msg)?;
+    let mut buffer = unsafe {
+        Buffer::from_memory_message_mut(
+            msg.body.memory_message_mut().ok_or(EthAppError::InvalidData)?,
+        )
+    };
 
-    let request: SignPersonalMessageRequest = buffer.to_original()
+    let request: SignPersonalMessageRequest = buffer
+        .to_original()
         .map_err(|_| EthAppError::SerializationError)?;
 
-    let signature = process_sign_personal_message(state, &request)?;
-
-    let bytes = rkyv::to_bytes::<_, 128>(&signature)
-        .map_err(|_| EthAppError::SerializationError)?;
-
-    let mut response = Buffer::into_buf(bytes.to_vec())
-        .map_err(|_| EthAppError::SerializationError)?;
-
-    response.replace(msg.body)
-        .map_err(|_| EthAppError::InternalError)?;
-
-    state.record_sign_success();
+    match process_sign_personal_message(state, &request) {
+        Ok(signature) => {
+            buffer.replace(signature).map_err(|_| EthAppError::InternalError)?;
+            state.record_sign_success();
+        }
+        Err(e) => write_error_response(&mut buffer, e),
+    }
     Ok(())
 }
 
-#[cfg(not(target_os = "xous"))]
+#[cfg(not(any(target_os = "xous", feature = "hosted-dabao")))]
 pub fn handle_sign_personal_message(
     state: &mut ServiceState,
     request: &SignPersonalMessageRequest,
@@ -384,14 +386,13 @@ fn process_sign_personal_message(
         return Err(EthAppError::RejectedByUser);
     }
 
-    // Get seed and derive key; sign in a tight scope so the signing key
-    // is dropped (and zeroized via k256's ZeroizeOnDrop) immediately after use.
-    let signature = {
-        let seed = get_seed()?;
-        let signing_key = derive_private_key(&seed, &request.path)?;
-        sign_personal_message(&signing_key, &request.message)?
-        // signing_key and seed dropped here, secret material zeroized
-    };
+    // Sign via bao-seed: compute hash locally, send hash + path to vault.
+    let hash = crate::crypto::eth_personal_message_hash(&request.message);
+    let path_vec = request.path.components.clone();
+    let raw = state.bao_seed()?
+        .secp256k1_sign(path_vec, hash)
+        .map_err(map_bao_seed_err)?;
+    let signature = crate::crypto::compose_personal_message_signature(raw);
 
     state.platform.show_info(true, "Message signed");
 
@@ -399,39 +400,40 @@ fn process_sign_personal_message(
 }
 
 /// Handle SignEip712Hashed request.
-#[cfg(target_os = "xous")]
+#[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
 pub fn handle_sign_eip712_hashed(
     state: &mut ServiceState,
-    msg: xous::MessageEnvelope,
+    mut msg: xous::MessageEnvelope,
 ) -> Result<(), EthAppError> {
     use xous_ipc::Buffer;
 
-    // Check if blind signing is enabled
+    // Create buffer first so we can write an error code back to the client.
+    let mut buffer = unsafe {
+        Buffer::from_memory_message_mut(
+            msg.body.memory_message_mut().ok_or(EthAppError::InvalidData)?,
+        )
+    };
+
     if !state.config.blind_signing_enabled {
-        return Err(EthAppError::BlindSigningDisabled);
+        write_error_response(&mut buffer, EthAppError::BlindSigningDisabled);
+        return Ok(());
     }
 
-    let buffer = extract_buffer(&msg)?;
-
-    let request: SignEip712HashedRequest = buffer.to_original()
+    let request: SignEip712HashedRequest = buffer
+        .to_original()
         .map_err(|_| EthAppError::SerializationError)?;
 
-    let signature = process_sign_eip712_hashed(state, &request)?;
-
-    let bytes = rkyv::to_bytes::<_, 128>(&signature)
-        .map_err(|_| EthAppError::SerializationError)?;
-
-    let mut response = Buffer::into_buf(bytes.to_vec())
-        .map_err(|_| EthAppError::SerializationError)?;
-
-    response.replace(msg.body)
-        .map_err(|_| EthAppError::InternalError)?;
-
-    state.record_sign_success();
+    match process_sign_eip712_hashed(state, &request) {
+        Ok(signature) => {
+            buffer.replace(signature).map_err(|_| EthAppError::InternalError)?;
+            state.record_sign_success();
+        }
+        Err(e) => write_error_response(&mut buffer, e),
+    }
     Ok(())
 }
 
-#[cfg(not(target_os = "xous"))]
+#[cfg(not(any(target_os = "xous", feature = "hosted-dabao")))]
 pub fn handle_sign_eip712_hashed(
     state: &mut ServiceState,
     request: &SignEip712HashedRequest,
@@ -459,14 +461,13 @@ fn process_sign_eip712_hashed(
         return Err(EthAppError::RejectedByUser);
     }
 
-    // Get seed and derive key; sign in a tight scope so the signing key
-    // is dropped (and zeroized via k256's ZeroizeOnDrop) immediately after use.
-    let signature = {
-        let seed = get_seed()?;
-        let signing_key = derive_private_key(&seed, &request.path)?;
-        sign_eip712(&signing_key, &request.domain_hash, &request.message_hash)?
-        // signing_key and seed dropped here, secret material zeroized
-    };
+    // Sign via bao-seed: compute EIP-712 hash locally, send to vault.
+    let hash = crate::crypto::eip712_signing_hash(&request.domain_hash, &request.message_hash);
+    let path_vec = request.path.components.clone();
+    let raw = state.bao_seed()?
+        .secp256k1_sign(path_vec, hash)
+        .map_err(map_bao_seed_err)?;
+    let signature = crate::crypto::compose_eip712_signature(raw);
 
     state.platform.show_info(true, "Typed data signed");
 
@@ -474,34 +475,34 @@ fn process_sign_eip712_hashed(
 }
 
 /// Handle SignEip712Message request.
-#[cfg(target_os = "xous")]
+#[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
 pub fn handle_sign_eip712_message(
     state: &mut ServiceState,
-    msg: xous::MessageEnvelope,
+    mut msg: xous::MessageEnvelope,
 ) -> Result<(), EthAppError> {
     use xous_ipc::Buffer;
 
-    let buffer = extract_buffer(&msg)?;
+    let mut buffer = unsafe {
+        Buffer::from_memory_message_mut(
+            msg.body.memory_message_mut().ok_or(EthAppError::InvalidData)?,
+        )
+    };
 
-    let request: SignEip712MessageRequest = buffer.to_original()
+    let request: SignEip712MessageRequest = buffer
+        .to_original()
         .map_err(|_| EthAppError::SerializationError)?;
 
-    let signature = process_sign_eip712_message(state, &request)?;
-
-    let bytes = rkyv::to_bytes::<_, 128>(&signature)
-        .map_err(|_| EthAppError::SerializationError)?;
-
-    let mut response = Buffer::into_buf(bytes.to_vec())
-        .map_err(|_| EthAppError::SerializationError)?;
-
-    response.replace(msg.body)
-        .map_err(|_| EthAppError::InternalError)?;
-
-    state.record_sign_success();
+    match process_sign_eip712_message(state, &request) {
+        Ok(signature) => {
+            buffer.replace(signature).map_err(|_| EthAppError::InternalError)?;
+            state.record_sign_success();
+        }
+        Err(e) => write_error_response(&mut buffer, e),
+    }
     Ok(())
 }
 
-#[cfg(not(target_os = "xous"))]
+#[cfg(not(any(target_os = "xous", feature = "hosted-dabao")))]
 pub fn handle_sign_eip712_message(
     state: &mut ServiceState,
     request: &SignEip712MessageRequest,
@@ -541,14 +542,13 @@ fn process_sign_eip712_message(
         return Err(EthAppError::RejectedByUser);
     }
 
-    // Get seed and derive key; sign in a tight scope so the signing key
-    // is dropped (and zeroized via k256's ZeroizeOnDrop) immediately after use.
-    let signature = {
-        let seed = get_seed()?;
-        let signing_key = derive_private_key(&seed, &request.path)?;
-        sign_eip712(&signing_key, &domain_hash, &message_hash)?
-        // signing_key and seed dropped here, secret material zeroized
-    };
+    // Sign via bao-seed: compute EIP-712 hash locally, send to vault.
+    let hash = crate::crypto::eip712_signing_hash(&domain_hash, &message_hash);
+    let path_vec = request.path.components.clone();
+    let raw = state.bao_seed()?
+        .secp256k1_sign(path_vec, hash)
+        .map_err(map_bao_seed_err)?;
+    let signature = crate::crypto::compose_eip712_signature(raw);
 
     state.platform.show_info(true, "Typed data signed");
 
@@ -560,14 +560,21 @@ fn process_sign_eip712_message(
 // =============================================================================
 
 /// Handle ProvideErc20TokenInfo request.
-#[cfg(target_os = "xous")]
+#[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
 pub fn handle_provide_erc20_token_info(
     state: &mut ServiceState,
-    msg: xous::MessageEnvelope,
+    mut msg: xous::MessageEnvelope,
 ) -> Result<(), EthAppError> {
-    let buffer = extract_buffer(&msg)?;
+    use xous_ipc::Buffer;
 
-    let request: ProvideTokenInfoRequest = buffer.to_original()
+    let mut buffer = unsafe {
+        Buffer::from_memory_message_mut(
+            msg.body.memory_message_mut().ok_or(EthAppError::InvalidData)?,
+        )
+    };
+
+    let request: ProvideTokenInfoRequest = buffer
+        .to_original()
         .map_err(|_| EthAppError::SerializationError)?;
 
     // Validate basic constraints
@@ -607,11 +614,11 @@ pub fn handle_provide_erc20_token_info(
 
     state.cache_token_info(unverified_info);
 
-    xous::return_scalar(msg.sender, 1) // accepted = true (but unverified)
-        .map_err(|_| EthAppError::InternalError)
+    buffer.replace(1u8).map_err(|_| EthAppError::InternalError)?;
+    Ok(())
 }
 
-#[cfg(not(target_os = "xous"))]
+#[cfg(not(any(target_os = "xous", feature = "hosted-dabao")))]
 pub fn handle_provide_erc20_token_info(
     state: &mut ServiceState,
     request: &ProvideTokenInfoRequest,
@@ -638,110 +645,454 @@ pub fn handle_provide_erc20_token_info(
 // These validate the incoming message format but return UnsupportedOperation
 // since the actual metadata processing is not yet implemented.
 
-#[cfg(target_os = "xous")]
+#[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
 pub fn handle_provide_nft_info(
     _state: &mut ServiceState,
-    msg: xous::MessageEnvelope,
+    mut msg: xous::MessageEnvelope,
 ) -> Result<(), EthAppError> {
     use ethapp_common::ProvideNftInfoRequest;
+    use xous_ipc::Buffer;
 
-    // Validate that we received a well-formed memory message
-    let buffer = extract_buffer(&msg)?;
+    let mut buffer = unsafe {
+        Buffer::from_memory_message_mut(
+            msg.body.memory_message_mut().ok_or(EthAppError::InvalidData)?,
+        )
+    };
 
-    // Deserialize to validate format (discard result)
-    let _request: ProvideNftInfoRequest = buffer.to_original()
+    let _request: ProvideNftInfoRequest = buffer
+        .to_original()
         .map_err(|_| EthAppError::SerializationError)?;
 
     log::warn!("ethapp: handle_provide_nft_info called but not yet implemented");
-
-    // Return error code indicating not yet implemented
-    xous::return_scalar(msg.sender, EthAppError::UnsupportedOperation.code() as usize)
-        .map_err(|_| EthAppError::InternalError)
+    buffer.replace(0u8).map_err(|_| EthAppError::InternalError)?;
+    Ok(())
 }
 
-#[cfg(target_os = "xous")]
+#[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
 pub fn handle_provide_domain_name(
     _state: &mut ServiceState,
-    msg: xous::MessageEnvelope,
+    mut msg: xous::MessageEnvelope,
 ) -> Result<(), EthAppError> {
     use ethapp_common::ProvideDomainNameRequest;
+    use xous_ipc::Buffer;
 
-    // Validate that we received a well-formed memory message
-    let buffer = extract_buffer(&msg)?;
+    let mut buffer = unsafe {
+        Buffer::from_memory_message_mut(
+            msg.body.memory_message_mut().ok_or(EthAppError::InvalidData)?,
+        )
+    };
 
-    // Deserialize to validate format (discard result)
-    let _request: ProvideDomainNameRequest = buffer.to_original()
+    let _request: ProvideDomainNameRequest = buffer
+        .to_original()
         .map_err(|_| EthAppError::SerializationError)?;
 
     log::warn!("ethapp: handle_provide_domain_name called but not yet implemented");
-
-    // Return error code indicating not yet implemented
-    xous::return_scalar(msg.sender, EthAppError::UnsupportedOperation.code() as usize)
-        .map_err(|_| EthAppError::InternalError)
+    buffer.replace(0u8).map_err(|_| EthAppError::InternalError)?;
+    Ok(())
 }
 
-#[cfg(target_os = "xous")]
+#[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
 pub fn handle_load_contract_method_info(
     _state: &mut ServiceState,
-    msg: xous::MessageEnvelope,
+    mut msg: xous::MessageEnvelope,
 ) -> Result<(), EthAppError> {
     use ethapp_common::ProvideMethodInfoRequest;
+    use xous_ipc::Buffer;
 
-    // Validate that we received a well-formed memory message
-    let buffer = extract_buffer(&msg)?;
+    let mut buffer = unsafe {
+        Buffer::from_memory_message_mut(
+            msg.body.memory_message_mut().ok_or(EthAppError::InvalidData)?,
+        )
+    };
 
-    // Deserialize to validate format (discard result)
-    let _request: ProvideMethodInfoRequest = buffer.to_original()
+    let _request: ProvideMethodInfoRequest = buffer
+        .to_original()
         .map_err(|_| EthAppError::SerializationError)?;
 
     log::warn!("ethapp: handle_load_contract_method_info called but not yet implemented");
-
-    // Return error code indicating not yet implemented
-    xous::return_scalar(msg.sender, EthAppError::UnsupportedOperation.code() as usize)
-        .map_err(|_| EthAppError::InternalError)
+    buffer.replace(0u8).map_err(|_| EthAppError::InternalError)?;
+    Ok(())
 }
 
 /// Handle ByContractAddressAndChain request.
 ///
-/// Uses a memory message to receive chain_id (u64) + address (20 bytes).
-/// A scalar message cannot carry a full Ethereum address on RV32:
-/// 4 scalar args * 4 bytes (usize on RV32) = 16 bytes, but
-/// chain_id (8 bytes) + address (20 bytes) = 28 bytes total needed.
-#[cfg(target_os = "xous")]
+/// Receives a `MetadataContext` (chain_id + address) via memory message and
+/// stores it as the current context for subsequent signing operations.
+#[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
 pub fn handle_by_contract_address_and_chain(
     state: &mut ServiceState,
-    msg: xous::MessageEnvelope,
+    mut msg: xous::MessageEnvelope,
 ) -> Result<(), EthAppError> {
-    // Use memory message to receive the full chain_id + address payload.
-    // Reject scalar messages -- they cannot carry a full 20-byte
-    // Ethereum address on RV32 (usize = 4, so 4 args = 16 bytes max).
-    let buffer = extract_buffer(&msg).map_err(|e| {
-        log::warn!(
-            "ethapp: handle_by_contract_address_and_chain requires a memory message, \
-             scalar messages truncate the 20-byte address on RV32"
-        );
-        e
-    })?;
+    use xous_ipc::Buffer;
 
-    let raw: &[u8] = buffer.as_flat::<u8, _>()
-        .map_err(|_| EthAppError::InvalidData)?;
+    let mut buffer = unsafe {
+        Buffer::from_memory_message_mut(
+            msg.body.memory_message_mut().ok_or(EthAppError::InvalidData)?,
+        )
+    };
 
-    // Expect exactly 28 bytes: chain_id (8 bytes BE) + address (20 bytes)
-    if raw.len() < 28 {
+    let context: MetadataContext = buffer
+        .to_original()
+        .map_err(|_| EthAppError::SerializationError)?;
+
+    state.set_context(context.chain_id, context.address);
+    buffer.replace(1u8).map_err(|_| EthAppError::InternalError)?;
+    Ok(())
+}
+
+// =============================================================================
+// Attestation Handlers
+// =============================================================================
+
+/// Process InitAttestation — generate attestation keypair from TRNG.
+fn process_init_attestation(
+    state: &mut ServiceState,
+    overwrite: bool,
+) -> Result<(), EthAppError> {
+    // Check if key already exists
+    if !overwrite {
+        if let Ok(Some(bytes)) = state.platform.load_value(crate::platform::PDDB_KEY_ATTESTATION) {
+            if bytes.len() == 32 {
+                return Err(EthAppError::AttestationKeyExists);
+            }
+        }
+    }
+
+    // Generate 32 random bytes from hardware TRNG
+    let mut key_bytes = [0u8; 32];
+    state.platform.rng_fill_bytes(&mut key_bytes)?;
+
+    // Construct signing key (validates the scalar is in range)
+    let signing_key = k256::ecdsa::SigningKey::from_bytes((&key_bytes[..]).into())
+        .map_err(|_| EthAppError::CryptoError)?;
+
+    // Store in PDDB
+    state.platform.store_value(crate::platform::PDDB_KEY_ATTESTATION, &key_bytes)?;
+
+    // Zeroize the raw bytes now that they're stored
+    zeroize::Zeroize::zeroize(&mut key_bytes);
+
+    // Cache in state
+    state.attestation_key = Some(signing_key);
+
+    log::info!("ethapp: Attestation key initialized");
+    Ok(())
+}
+
+/// Process GetAttestationKey — return the compressed attestation public key.
+fn process_get_attestation_key(
+    state: &mut ServiceState,
+) -> Result<AttestationKeyResponse, EthAppError> {
+    let key = state.get_attestation_key()?;
+    let pubkey = get_compressed_pubkey(key);
+    Ok(AttestationKeyResponse { pubkey })
+}
+
+/// Process AttestSign — sign a transaction and produce an attestation co-signature.
+fn process_attest_sign(
+    state: &mut ServiceState,
+    request: &SignTransactionRequest,
+) -> Result<AttestedSignature, EthAppError> {
+    // Sign the transaction (reuses all validation, UI confirmation, etc.)
+    let (tx_sig, sign_hash) = process_sign_transaction_inner(state, request)?;
+
+    // Produce the attestation co-signature
+    let attest_key = state.get_attestation_key()?;
+    let attest_sig = attest_transaction_signature(attest_key, &sign_hash, &tx_sig)?;
+
+    state.record_sign_success();
+    Ok(AttestedSignature { tx_sig, attest_sig })
+}
+
+/// Handle InitAttestation request via serial.
+#[cfg(not(any(target_os = "xous", feature = "hosted-dabao")))]
+pub fn handle_init_attestation(
+    state: &mut ServiceState,
+    request: &InitAttestationRequest,
+) -> Result<(), EthAppError> {
+    process_init_attestation(state, request.overwrite)
+}
+
+/// Handle GetAttestationKey request via serial.
+#[cfg(not(any(target_os = "xous", feature = "hosted-dabao")))]
+pub fn handle_get_attestation_key(
+    state: &mut ServiceState,
+    _msg: (),
+) -> Result<AttestationKeyResponse, EthAppError> {
+    process_get_attestation_key(state)
+}
+
+/// Handle AttestSign request via serial.
+#[cfg(not(any(target_os = "xous", feature = "hosted-dabao")))]
+pub fn handle_attest_sign(
+    state: &mut ServiceState,
+    request: &SignTransactionRequest,
+) -> Result<AttestedSignature, EthAppError> {
+    process_attest_sign(state, request)
+}
+
+/// Handle InitAttestation request via Xous IPC.
+#[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
+pub fn handle_init_attestation(
+    state: &mut ServiceState,
+    mut msg: xous::MessageEnvelope,
+) -> Result<(), EthAppError> {
+    use xous_ipc::Buffer;
+
+    let mut buffer = unsafe {
+        Buffer::from_memory_message_mut(
+            msg.body.memory_message_mut().ok_or(EthAppError::InvalidData)?,
+        )
+    };
+
+    let request: InitAttestationRequest = buffer
+        .to_original()
+        .map_err(|_| EthAppError::SerializationError)?;
+
+    match process_init_attestation(state, request.overwrite) {
+        Ok(()) => {
+            buffer.replace(1u8).map_err(|_| EthAppError::InternalError)?;
+        }
+        Err(e) => write_error_response(&mut buffer, e),
+    }
+    Ok(())
+}
+
+/// Handle GetAttestationKey request via Xous IPC.
+#[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
+pub fn handle_get_attestation_key(
+    state: &mut ServiceState,
+    mut msg: xous::MessageEnvelope,
+) -> Result<(), EthAppError> {
+    use xous_ipc::Buffer;
+
+    let mut buffer = unsafe {
+        Buffer::from_memory_message_mut(
+            msg.body.memory_message_mut().ok_or(EthAppError::InvalidData)?,
+        )
+    };
+
+    match process_get_attestation_key(state) {
+        Ok(resp) => {
+            buffer.replace(resp).map_err(|_| EthAppError::InternalError)?;
+        }
+        Err(e) => write_error_response(&mut buffer, e),
+    }
+    Ok(())
+}
+
+/// Handle AttestSign request via Xous IPC.
+#[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
+pub fn handle_attest_sign(
+    state: &mut ServiceState,
+    mut msg: xous::MessageEnvelope,
+) -> Result<(), EthAppError> {
+    use xous_ipc::Buffer;
+
+    let mut buffer = unsafe {
+        Buffer::from_memory_message_mut(
+            msg.body.memory_message_mut().ok_or(EthAppError::InvalidData)?,
+        )
+    };
+
+    let request: SignTransactionRequest = buffer
+        .to_original()
+        .map_err(|_| EthAppError::SerializationError)?;
+
+    match process_attest_sign(state, &request) {
+        Ok(attested) => {
+            buffer.replace(attested).map_err(|_| EthAppError::InternalError)?;
+        }
+        Err(e) => write_error_response(&mut buffer, e),
+    }
+    Ok(())
+}
+
+// =============================================================================
+// Encrypted Import Handlers
+// =============================================================================
+
+/// Process InitImportKey — generate import keypair from TRNG.
+fn process_init_import_key(
+    state: &mut ServiceState,
+    overwrite: bool,
+) -> Result<(), EthAppError> {
+    if !overwrite {
+        if let Ok(Some(bytes)) = state.platform.load_value(crate::platform::PDDB_KEY_IMPORT) {
+            if bytes.len() == 32 {
+                return Err(EthAppError::ImportKeyExists);
+            }
+        }
+    }
+
+    let mut key_bytes = [0u8; 32];
+    state.platform.rng_fill_bytes(&mut key_bytes)?;
+
+    let signing_key = k256::ecdsa::SigningKey::from_bytes((&key_bytes[..]).into())
+        .map_err(|_| EthAppError::CryptoError)?;
+
+    state.platform.store_value(crate::platform::PDDB_KEY_IMPORT, &key_bytes)?;
+    zeroize::Zeroize::zeroize(&mut key_bytes);
+
+    state.import_key = Some(signing_key);
+    log::info!("ethapp: Import key initialized");
+    Ok(())
+}
+
+/// Process GetImportKey — return the compressed import public key.
+fn process_get_import_key(
+    state: &mut ServiceState,
+) -> Result<ethapp_common::ImportKeyResponse, EthAppError> {
+    let key = state.get_import_key()?;
+    let pubkey = get_compressed_pubkey(key);
+    Ok(ethapp_common::ImportKeyResponse { pubkey })
+}
+
+/// Process ImportEncrypted — decrypt ECIES payload and import the mnemonic
+/// into bao-seed.
+fn process_import_encrypted(
+    state: &mut ServiceState,
+    payload: &[u8],
+) -> Result<(), EthAppError> {
+    let import_key = state.get_import_key()?.clone();
+
+    // Decrypt the ECIES payload
+    let mut plaintext = crate::crypto::ecies_decrypt(&import_key, payload)?;
+
+    // Validate: must be valid UTF-8 with 12 or 24 whitespace-separated words
+    let mnemonic_str = match core::str::from_utf8(&plaintext) {
+        Ok(s) => s.to_string(),
+        Err(_) => {
+            zeroize::Zeroize::zeroize(&mut plaintext);
+            return Err(EthAppError::InvalidData);
+        }
+    };
+    let word_count = mnemonic_str.split_whitespace().count();
+    if word_count != 12 && word_count != 24 {
+        zeroize::Zeroize::zeroize(&mut plaintext);
         return Err(EthAppError::InvalidData);
     }
 
-    let mut chain_id_bytes = [0u8; 8];
-    chain_id_bytes.copy_from_slice(&raw[..8]);
-    let chain_id = u64::from_be_bytes(chain_id_bytes);
+    // Push the mnemonic into bao-seed (which validates the BIP-39
+    // wordlist + checksum, derives, and stores). Wipe any existing
+    // seed first — Import refuses to overwrite.
+    let words: Vec<String> = mnemonic_str.split_whitespace().map(String::from).collect();
+    zeroize::Zeroize::zeroize(&mut plaintext);
+    let mw = bao_seed_common::MnemonicWords::new(words)
+        .map_err(|_| EthAppError::InvalidData)?;
+    let client = state.bao_seed()?;
+    let _ = client.wipe();
+    client.import(mw).map_err(|_| EthAppError::InternalError)?;
 
-    let mut address = [0u8; 20];
-    address.copy_from_slice(&raw[8..28]);
+    log::info!("ethapp: Encrypted mnemonic imported into bao-seed ({} words)", word_count);
+    Ok(())
+}
 
-    state.set_context(chain_id, address);
+/// Handle InitImportKey via Xous IPC.
+#[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
+pub fn handle_init_import_key(
+    state: &mut ServiceState,
+    mut msg: xous::MessageEnvelope,
+) -> Result<(), EthAppError> {
+    use ethapp_common::InitImportKeyRequest;
+    use xous_ipc::Buffer;
 
-    xous::return_scalar(msg.sender, 1)
-        .map_err(|_| EthAppError::InternalError)
+    let mut buffer = unsafe {
+        Buffer::from_memory_message_mut(
+            msg.body.memory_message_mut().ok_or(EthAppError::InvalidData)?,
+        )
+    };
+
+    let request: InitImportKeyRequest = buffer
+        .to_original()
+        .map_err(|_| EthAppError::SerializationError)?;
+
+    match process_init_import_key(state, request.overwrite) {
+        Ok(()) => {
+            buffer.replace(1u8).map_err(|_| EthAppError::InternalError)?;
+        }
+        Err(e) => write_error_response(&mut buffer, e),
+    }
+    Ok(())
+}
+
+/// Handle GetImportKey via Xous IPC.
+#[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
+pub fn handle_get_import_key(
+    state: &mut ServiceState,
+    mut msg: xous::MessageEnvelope,
+) -> Result<(), EthAppError> {
+    use xous_ipc::Buffer;
+
+    let mut buffer = unsafe {
+        Buffer::from_memory_message_mut(
+            msg.body.memory_message_mut().ok_or(EthAppError::InvalidData)?,
+        )
+    };
+
+    match process_get_import_key(state) {
+        Ok(resp) => {
+            buffer.replace(resp).map_err(|_| EthAppError::InternalError)?;
+        }
+        Err(e) => write_error_response(&mut buffer, e),
+    }
+    Ok(())
+}
+
+/// Handle ImportEncrypted via Xous IPC.
+#[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
+pub fn handle_import_encrypted(
+    state: &mut ServiceState,
+    mut msg: xous::MessageEnvelope,
+) -> Result<(), EthAppError> {
+    use ethapp_common::EncryptedMnemonicImport;
+    use xous_ipc::Buffer;
+
+    let mut buffer = unsafe {
+        Buffer::from_memory_message_mut(
+            msg.body.memory_message_mut().ok_or(EthAppError::InvalidData)?,
+        )
+    };
+
+    let import: EncryptedMnemonicImport = buffer
+        .to_original()
+        .map_err(|_| EthAppError::SerializationError)?;
+
+    let payload = &import.data[..import.len as usize];
+    match process_import_encrypted(state, payload) {
+        Ok(()) => {
+            buffer.replace(1u8).map_err(|_| EthAppError::InternalError)?;
+        }
+        Err(e) => write_error_response(&mut buffer, e),
+    }
+    Ok(())
+}
+
+/// Handle InitImportKey (host testing).
+#[cfg(not(any(target_os = "xous", feature = "hosted-dabao")))]
+pub fn handle_init_import_key(
+    state: &mut ServiceState,
+    request: &ethapp_common::InitImportKeyRequest,
+) -> Result<(), EthAppError> {
+    process_init_import_key(state, request.overwrite)
+}
+
+/// Handle GetImportKey (host testing).
+#[cfg(not(any(target_os = "xous", feature = "hosted-dabao")))]
+pub fn handle_get_import_key(
+    state: &mut ServiceState,
+    _msg: (),
+) -> Result<ethapp_common::ImportKeyResponse, EthAppError> {
+    process_get_import_key(state)
+}
+
+/// Handle ImportEncrypted (host testing).
+#[cfg(not(any(target_os = "xous", feature = "hosted-dabao")))]
+pub fn handle_import_encrypted(
+    state: &mut ServiceState,
+    payload: &[u8],
+) -> Result<(), EthAppError> {
+    process_import_encrypted(state, payload)
 }
 
 // =============================================================================
@@ -749,88 +1100,86 @@ pub fn handle_by_contract_address_and_chain(
 // =============================================================================
 
 /// Handle GetPublicKey request.
-#[cfg(target_os = "xous")]
+#[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
 pub fn handle_get_public_key(
     state: &mut ServiceState,
-    msg: xous::MessageEnvelope,
+    mut msg: xous::MessageEnvelope,
 ) -> Result<(), EthAppError> {
     use xous_ipc::Buffer;
 
-    let buffer = extract_buffer(&msg)?;
+    let mut buffer = unsafe {
+        Buffer::from_memory_message_mut(
+            msg.body.memory_message_mut().ok_or(EthAppError::InvalidData)?,
+        )
+    };
 
-    let path: Bip32Path = buffer.to_original()
+    let path: Bip32Path = buffer
+        .to_original()
         .map_err(|_| EthAppError::SerializationError)?;
 
-    let response = process_get_public_key(&path)?;
-
-    let bytes = rkyv::to_bytes::<_, 128>(&response)
-        .map_err(|_| EthAppError::SerializationError)?;
-
-    let mut response_buf = Buffer::into_buf(bytes.to_vec())
-        .map_err(|_| EthAppError::SerializationError)?;
-
-    response_buf.replace(msg.body)
-        .map_err(|_| EthAppError::InternalError)?;
-
+    match process_get_public_key(state, &path) {
+        Ok(response) => buffer.replace(response).map_err(|_| EthAppError::InternalError)?,
+        Err(e) => write_error_response(&mut buffer, e),
+    }
     Ok(())
 }
 
-#[cfg(not(target_os = "xous"))]
+#[cfg(not(any(target_os = "xous", feature = "hosted-dabao")))]
 pub fn handle_get_public_key(
-    _state: &mut ServiceState,
+    state: &mut ServiceState,
     path: &Bip32Path,
 ) -> Result<PublicKeyResponse, EthAppError> {
-    process_get_public_key(path)
+    process_get_public_key(state, path)
 }
 
-fn process_get_public_key(path: &Bip32Path) -> Result<PublicKeyResponse, EthAppError> {
+fn process_get_public_key(state: &mut ServiceState, path: &Bip32Path) -> Result<PublicKeyResponse, EthAppError> {
     if !path.is_valid_ethereum_path() {
         return Err(EthAppError::InvalidDerivationPath);
     }
 
-    // Derive key in a scope to ensure prompt zeroization of secret material.
-    let (pubkey, address) = {
-        let seed = get_seed()?;
-        let signing_key = derive_private_key(&seed, path)?;
-        let pk = get_compressed_pubkey(&signing_key);
-        let addr = public_key_to_address(&get_public_key(&signing_key));
-        (pk, addr)
-        // signing_key and seed dropped here, secret material zeroized
-    };
+    // Derive pubkey via bao-seed; ethapp computes the Ethereum address
+    // locally from the compressed pubkey (no private key ever leaves
+    // the vault).
+    let path_vec = path.components.clone();
+    let pubkey = state.bao_seed()?
+        .secp256k1_get_pubkey(path_vec)
+        .map_err(map_bao_seed_err)?;
+    let address = crate::crypto::address_from_compressed_pubkey(&pubkey)?;
 
     Ok(PublicKeyResponse { pubkey, address })
 }
 
 /// Handle GetAddress request.
-#[cfg(target_os = "xous")]
+#[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
 pub fn handle_get_address(
     state: &mut ServiceState,
-    msg: xous::MessageEnvelope,
+    mut msg: xous::MessageEnvelope,
 ) -> Result<(), EthAppError> {
     use xous_ipc::Buffer;
 
-    let buffer = extract_buffer(&msg)?;
+    let mut buffer = unsafe {
+        Buffer::from_memory_message_mut(
+            msg.body.memory_message_mut().ok_or(EthAppError::InvalidData)?,
+        )
+    };
 
-    let path: Bip32Path = buffer.to_original()
+    let path: Bip32Path = buffer
+        .to_original()
         .map_err(|_| EthAppError::SerializationError)?;
 
-    let response = process_get_public_key(&path)?;
-
-    let mut response_buf = Buffer::into_buf(response.address.to_vec())
-        .map_err(|_| EthAppError::SerializationError)?;
-
-    response_buf.replace(msg.body)
-        .map_err(|_| EthAppError::InternalError)?;
-
+    match process_get_public_key(state, &path) {
+        Ok(response) => buffer.replace(response.address).map_err(|_| EthAppError::InternalError)?,
+        Err(e) => write_error_response(&mut buffer, e),
+    }
     Ok(())
 }
 
-#[cfg(not(target_os = "xous"))]
+#[cfg(not(any(target_os = "xous", feature = "hosted-dabao")))]
 pub fn handle_get_address(
-    _state: &mut ServiceState,
+    state: &mut ServiceState,
     path: &Bip32Path,
 ) -> Result<[u8; 20], EthAppError> {
-    let response = process_get_public_key(path)?;
+    let response = process_get_public_key(state, path)?;
     Ok(response.address)
 }
 
@@ -838,7 +1187,7 @@ pub fn handle_get_address(
 // Statistics Handler
 // =============================================================================
 
-#[cfg(target_os = "xous")]
+#[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
 pub fn handle_get_stats(
     state: &mut ServiceState,
     msg: xous::MessageEnvelope,
@@ -853,11 +1202,550 @@ pub fn handle_get_stats(
     ).map_err(|_| EthAppError::InternalError)
 }
 
-#[cfg(not(target_os = "xous"))]
+#[cfg(not(any(target_os = "xous", feature = "hosted-dabao")))]
 pub fn handle_get_stats(
     state: &mut ServiceState,
     _msg: (),
 ) -> Result<(u64, u64, u64), EthAppError> {
     let stats = state.get_stats();
     Ok((stats.signs_completed, stats.signs_rejected, stats.errors))
+}
+
+// =============================================================================
+// Seed Management Handlers
+// =============================================================================
+
+/// Handle SetSeed request — import a 64-byte seed at runtime.
+#[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
+pub fn handle_set_seed(
+    state: &mut ServiceState,
+    mut msg: xous::MessageEnvelope,
+) -> Result<(), EthAppError> {
+    use xous_ipc::Buffer;
+
+    let buffer = unsafe {
+        Buffer::from_memory_message_mut(
+            msg.body.memory_message_mut().ok_or(EthAppError::InvalidData)?,
+        )
+    };
+
+    let seed_bytes: [u8; 64] = buffer
+        .to_original()
+        .map_err(|_| EthAppError::SerializationError)?;
+
+    // Push the raw seed into bao-seed; ethapp never holds it. Wipe
+    // first so callers can re-import without an explicit ClearSeed
+    // (matches the prior SetSeed behaviour, which overwrote silently).
+    let client = state.bao_seed()?;
+    let _ = client.wipe();
+    client
+        .import_seed_bytes(&seed_bytes)
+        .map_err(map_bao_seed_err)?;
+    log::info!("ethapp: Seed imported via bao-seed (64 bytes)");
+
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "xous", feature = "hosted-dabao")))]
+pub fn handle_set_seed(
+    state: &mut ServiceState,
+    seed_bytes: &[u8; 64],
+) -> Result<(), EthAppError> {
+    state.imported_seed = Some(crate::crypto::Seed::from_bytes(seed_bytes));
+    Ok(())
+}
+
+/// Push a BIP-39 mnemonic into the bao-seed vault.
+///
+/// Shared between the IPC handler and the serial 0x61 handler so both
+/// paths land the seed in the same place. Empty/invalid payloads
+/// surface as `InvalidData`.
+#[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
+pub fn process_import_mnemonic(
+    state: &mut ServiceState,
+    mnemonic_bytes: &[u8],
+) -> Result<(), EthAppError> {
+    if mnemonic_bytes.is_empty() {
+        return Err(EthAppError::InvalidData);
+    }
+    let mnemonic_str = core::str::from_utf8(mnemonic_bytes)
+        .map_err(|_| EthAppError::InvalidData)?;
+    let words: Vec<String> = mnemonic_str.split_whitespace().map(String::from).collect();
+    let mw = bao_seed_common::MnemonicWords::new(words)
+        .map_err(|_| EthAppError::InvalidData)?;
+    let client = state.bao_seed()?;
+    let _ = client.wipe();
+    client.import(mw).map_err(|_| EthAppError::InternalError)?;
+    log::info!("ethapp: Mnemonic imported into bao-seed");
+    Ok(())
+}
+
+/// Handle ImportMnemonic request — pushes a BIP-39 mnemonic into bao-seed.
+#[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
+pub fn handle_import_mnemonic(
+    state: &mut ServiceState,
+    mut msg: xous::MessageEnvelope,
+) -> Result<(), EthAppError> {
+    use xous_ipc::Buffer;
+    use ethapp_common::MnemonicImport;
+
+    let buffer = unsafe {
+        Buffer::from_memory_message_mut(
+            msg.body.memory_message_mut().ok_or(EthAppError::InvalidData)?,
+        )
+    };
+
+    let import: MnemonicImport = buffer
+        .to_original()
+        .map_err(|_| EthAppError::SerializationError)?;
+
+    process_import_mnemonic(state, import.as_bytes())
+}
+
+#[cfg(not(any(target_os = "xous", feature = "hosted-dabao")))]
+pub fn handle_import_mnemonic(
+    state: &mut ServiceState,
+    mnemonic: &str,
+) -> Result<(), EthAppError> {
+    let seed = crate::crypto::seed_from_mnemonic(mnemonic.as_bytes());
+    state.imported_seed = Some(seed);
+    Ok(())
+}
+
+// =============================================================================
+// Generate Mnemonic Handler
+// =============================================================================
+
+/// Handle GenerateMnemonic request — generate a new 24-word BIP39 mnemonic.
+///
+/// The mnemonic is displayed on the device screen and never sent over USB/IPC.
+/// Only a success/failure scalar is returned to the caller.
+#[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
+pub fn handle_generate_mnemonic(
+    state: &mut ServiceState,
+    msg: xous::MessageEnvelope,
+) -> Result<(), EthAppError> {
+    match process_generate_mnemonic(state) {
+        Ok(_words) => return_success(msg),
+        Err(e) => return_error(msg, e),
+    }
+}
+
+#[cfg(not(any(target_os = "xous", feature = "hosted-dabao")))]
+pub fn handle_generate_mnemonic(
+    state: &mut ServiceState,
+    _msg: (),
+) -> Result<(), EthAppError> {
+    process_generate_mnemonic(state).map(|_| ())
+}
+
+/// Returns the generated mnemonic words (for dev-mode serial response).
+/// On production builds the words are only shown on the device screen.
+fn process_generate_mnemonic(state: &mut ServiceState) -> Result<Vec<String>, EthAppError> {
+    // Delegate generation to bao-seed — it owns entropy and seed.
+    // ethapp receives the mnemonic words back (for display), but never
+    // sees or stores the seed bytes.
+    let client = state.bao_seed()?;
+    let _ = client.wipe(); // ensure clean slate; Generate refuses on existing seed
+    let resp = client.generate(24).map_err(|_| EthAppError::InternalError)?;
+    let words: Vec<String> = resp.words.as_slice().to_vec();
+
+    // Display the mnemonic on device screen for the user to write down.
+    let mut fields: Vec<(&str, String)> = Vec::new();
+    for (i, word) in words.iter().enumerate() {
+        fields.push(("", format!("{}. {}", i + 1, word)));
+    }
+    let field_refs: Vec<(&str, &str)> = fields.iter()
+        .map(|(k, v)| (*k, v.as_str()))
+        .collect();
+
+    if !state.platform.show_transaction_review(&field_refs, "Write down your recovery phrase")? {
+        // User rejected — wipe bao-seed so we don't leave a half-committed seed.
+        let _ = state.bao_seed().and_then(|c| c.wipe().map_err(|_| EthAppError::InternalError));
+        return Err(EthAppError::RejectedByUser);
+    }
+
+    // Ask user to confirm they've written it down
+    if !state.platform.confirm_action(
+        "Confirm Backup",
+        "Have you written down all 24 words? This is the ONLY way to recover your wallet.",
+    )? {
+        let _ = state.bao_seed().and_then(|c| c.wipe().map_err(|_| EthAppError::InternalError));
+        return Err(EthAppError::RejectedByUser);
+    }
+
+    state.platform.show_info(true, "Wallet created successfully");
+    log::info!("ethapp: New mnemonic generated via bao-seed");
+
+    Ok(words)
+}
+
+// =============================================================================
+// Clear Seed Handler
+// =============================================================================
+
+/// Handle ClearSeed request — wipe the master seed from memory and storage.
+#[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
+pub fn handle_clear_seed(
+    state: &mut ServiceState,
+    msg: xous::MessageEnvelope,
+) -> Result<(), EthAppError> {
+    match process_clear_seed(state) {
+        Ok(()) => return_success(msg),
+        Err(e) => return_error(msg, e),
+    }
+}
+
+#[cfg(not(any(target_os = "xous", feature = "hosted-dabao")))]
+pub fn handle_clear_seed(
+    state: &mut ServiceState,
+    _msg: (),
+) -> Result<(), EthAppError> {
+    process_clear_seed(state)
+}
+
+fn process_clear_seed(state: &mut ServiceState) -> Result<(), EthAppError> {
+    // Require user confirmation before wiping
+    if !state.platform.confirm_action(
+        "Wipe Wallet",
+        "This will permanently delete the master seed. Are you sure?",
+    )? {
+        return Err(EthAppError::RejectedByUser);
+    }
+
+    // Delegate wipe to bao-seed (idempotent — safe even if empty).
+    state.bao_seed()?
+        .wipe()
+        .map_err(|_| EthAppError::InternalError)?;
+
+    state.platform.show_info(true, "Wallet wiped");
+    log::info!("ethapp: bao-seed wiped");
+
+    Ok(())
+}
+
+// =============================================================================
+// Dangerous Mainnet Handler
+// =============================================================================
+
+/// Handle EnableDangerousMainnet — allow mainnet signing on displayless builds.
+///
+/// This is a session-only flag that resets on reboot. Only meaningful when
+/// the `autoapprove` or `dev-mode` features are compiled in; on production
+/// builds the mainnet guard doesn't exist so this is a no-op.
+#[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
+pub fn handle_enable_dangerous_mainnet(
+    state: &mut ServiceState,
+    msg: xous::MessageEnvelope,
+) -> Result<(), EthAppError> {
+    state.dangerous_mainnet = true;
+    log::warn!("ethapp: *** DANGEROUS MAINNET MODE ENABLED ***");
+    log::warn!("ethapp: This device has NO trusted display. Signing on mainnet");
+    log::warn!("ethapp: chains is now permitted. YOU are responsible for verifying");
+    log::warn!("ethapp: every transaction. The host software is UNTRUSTED.");
+    log::warn!("ethapp: This mode resets on reboot.");
+    return_success(msg)
+}
+
+#[cfg(not(any(target_os = "xous", feature = "hosted-dabao")))]
+pub fn handle_enable_dangerous_mainnet(
+    state: &mut ServiceState,
+    _msg: (),
+) -> Result<(), EthAppError> {
+    state.dangerous_mainnet = true;
+    Ok(())
+}
+
+// =============================================================================
+// Serial Frame Handler
+// =============================================================================
+
+/// Handle a raw serial frame from the host CLI.
+///
+/// The frame data arrives as [opcode, payload...] and the response
+/// is written back as [status, payload...].
+#[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
+pub fn handle_serial_frame(
+    state: &mut ServiceState,
+    mut msg: xous::MessageEnvelope,
+) -> Result<(), EthAppError> {
+    use ethapp_common::SerialFrameData;
+    use xous_ipc::Buffer;
+
+    let mut buffer = unsafe {
+        Buffer::from_memory_message_mut(
+            msg.body.memory_message_mut().ok_or(EthAppError::InvalidData)?,
+        )
+    };
+
+    let frame: SerialFrameData = buffer
+        .to_original()
+        .map_err(|_| EthAppError::SerializationError)?;
+
+    if frame.data.is_empty() {
+        let resp = SerialFrameData { data: vec![crate::serial::STATUS_ERR_INTERNAL] };
+        buffer.replace(resp).map_err(|_| EthAppError::InternalError)?;
+        return Ok(());
+    }
+
+    let opcode = frame.data[0];
+    let payload = &frame.data[1..];
+    let response_data = process_serial_command(state, opcode, payload);
+
+    let resp = SerialFrameData { data: response_data };
+    buffer.replace(resp).map_err(|_| EthAppError::InternalError)?;
+    Ok(())
+}
+
+/// Process a serial command and return the response bytes [status, payload...].
+fn process_serial_command(
+    state: &mut ServiceState,
+    opcode: u8,
+    payload: &[u8],
+) -> Vec<u8> {
+    use crate::serial::*;
+
+    match opcode {
+        // Ping
+        0xFF => vec![STATUS_OK],
+
+        // GetAddress
+        0x51 => {
+            match parse_bip32_path(payload) {
+                Some(path) => {
+                    match process_get_public_key(state, &path) {
+                        Ok(resp) => {
+                            let mut out = vec![STATUS_OK];
+                            out.extend_from_slice(&resp.address);
+                            out
+                        }
+                        Err(e) => vec![error_to_status(&e)],
+                    }
+                }
+                None => vec![STATUS_ERR_INVALID_PATH],
+            }
+        }
+
+        // GetAppConfiguration
+        0x01 => {
+            let cfg = &state.config;
+            let mut flags = 0u8;
+            if cfg.blind_signing_enabled { flags |= 0x01; }
+            if cfg.eth2_supported { flags |= 0x02; }
+            let mut out = vec![STATUS_OK];
+            out.extend_from_slice(&[
+                cfg.version_major, cfg.version_minor, cfg.version_patch,
+                cfg.protocol_version as u8, flags,
+            ]);
+            out
+        }
+
+        // GenerateMnemonic
+        0x62 => {
+            match process_generate_mnemonic(state) {
+                Ok(words) => {
+                    let mut out = vec![STATUS_OK];
+                    // On dev-mode builds, include the mnemonic in the response
+                    // so the host CLI can display it (dabao has no screen).
+                    // On production builds, the words are only on the device screen.
+                    #[cfg(feature = "dev-mode")]
+                    {
+                        let mnemonic_str = words.join(" ");
+                        out.extend_from_slice(mnemonic_str.as_bytes());
+                    }
+                    #[cfg(not(feature = "dev-mode"))]
+                    { let _ = words; }
+                    out
+                }
+                Err(e) => vec![error_to_status(&e)],
+            }
+        }
+
+        // ClearSeed
+        0x63 => {
+            match process_clear_seed(state) {
+                Ok(()) => vec![STATUS_OK],
+                Err(e) => vec![error_to_status(&e)],
+            }
+        }
+
+        // EnableDangerousMainnet
+        0x64 => {
+            state.dangerous_mainnet = true;
+            log::warn!("ethapp: *** DANGEROUS MAINNET MODE ENABLED via serial ***");
+            vec![STATUS_OK]
+        }
+
+        // ImportMnemonic — delegate to bao-seed via the shared helper so
+        // serial and IPC both land the seed in the same vault.
+        0x61 => {
+            match process_import_mnemonic(state, payload) {
+                Ok(()) => {
+                    log::info!("ethapp: Serial mnemonic import ({} bytes)", payload.len());
+                    vec![STATUS_OK]
+                }
+                Err(e) => vec![error_to_status(&e)],
+            }
+        }
+
+        // SignPersonalMessage — payload: [path_bytes...][message_bytes...]
+        0x20 => {
+            match parse_bip32_path_and_remainder(payload) {
+                Some((path, message)) => {
+                    let request = SignPersonalMessageRequest {
+                        path,
+                        message: message.to_vec(),
+                    };
+                    match process_sign_personal_message(state, &request) {
+                        Ok(sig) => signature_response(&sig),
+                        Err(e) => vec![error_to_status(&e)],
+                    }
+                }
+                None => vec![STATUS_ERR_INVALID_PATH],
+            }
+        }
+
+        // SignTransaction — payload: [path_bytes...][rlp_tx_bytes...]
+        0x10 => {
+            match parse_bip32_path_and_remainder(payload) {
+                Some((path, tx_data)) => {
+                    let request = SignTransactionRequest {
+                        path,
+                        tx_data: tx_data.to_vec(),
+                    };
+                    match process_sign_transaction(state, &request) {
+                        Ok(sig) => signature_response(&sig),
+                        Err(e) => vec![error_to_status(&e)],
+                    }
+                }
+                None => vec![STATUS_ERR_INVALID_PATH],
+            }
+        }
+
+        // InitAttestation — payload: [overwrite: u8] (0=no, 1=yes)
+        0x80 => {
+            let overwrite = payload.first().copied().unwrap_or(0) != 0;
+            match process_init_attestation(state, overwrite) {
+                Ok(()) => vec![STATUS_OK],
+                Err(e) => vec![error_to_status(&e)],
+            }
+        }
+
+        // GetAttestationKey
+        0x81 => {
+            match process_get_attestation_key(state) {
+                Ok(resp) => {
+                    let mut out = vec![STATUS_OK];
+                    out.extend_from_slice(&resp.pubkey);
+                    out
+                }
+                Err(e) => vec![error_to_status(&e)],
+            }
+        }
+
+        // AttestSign — payload: [path_bytes...][rlp_tx_bytes...]
+        0x82 => {
+            match parse_bip32_path_and_remainder(payload) {
+                Some((path, tx_data)) => {
+                    let request = SignTransactionRequest {
+                        path,
+                        tx_data: tx_data.to_vec(),
+                    };
+                    match process_attest_sign(state, &request) {
+                        Ok(attested) => {
+                            let mut out = vec![STATUS_OK];
+                            // tx signature: v(8 LE) + r(32) + s(32)
+                            out.extend_from_slice(&attested.tx_sig.v.to_le_bytes());
+                            out.extend_from_slice(&attested.tx_sig.r);
+                            out.extend_from_slice(&attested.tx_sig.s);
+                            // attestation co-signature: v(8 LE) + r(32) + s(32)
+                            out.extend_from_slice(&attested.attest_sig.v.to_le_bytes());
+                            out.extend_from_slice(&attested.attest_sig.r);
+                            out.extend_from_slice(&attested.attest_sig.s);
+                            out
+                        }
+                        Err(e) => vec![error_to_status(&e)],
+                    }
+                }
+                None => vec![STATUS_ERR_INVALID_PATH],
+            }
+        }
+
+        // InitImportKey — payload: [overwrite: u8]
+        0x65 => {
+            let overwrite = payload.first().copied().unwrap_or(0) != 0;
+            match process_init_import_key(state, overwrite) {
+                Ok(()) => vec![STATUS_OK],
+                Err(e) => vec![error_to_status(&e)],
+            }
+        }
+
+        // GetImportKey
+        0x66 => {
+            match process_get_import_key(state) {
+                Ok(resp) => {
+                    let mut out = vec![STATUS_OK];
+                    out.extend_from_slice(&resp.pubkey);
+                    out
+                }
+                Err(e) => vec![error_to_status(&e)],
+            }
+        }
+
+        // ImportEncrypted — payload: [e_pub:33][ciphertext+tag]
+        0x67 => {
+            match process_import_encrypted(state, payload) {
+                Ok(()) => vec![STATUS_OK],
+                Err(e) => vec![error_to_status(&e)],
+            }
+        }
+
+        _ => {
+            log::warn!("ethapp: Unknown serial opcode: 0x{:02x}", opcode);
+            vec![STATUS_ERR_INVALID_OPCODE]
+        }
+    }
+}
+
+/// Parse a BIP32 path from the start of a payload.
+/// Format: [depth: u8][component0: u32 BE][component1: u32 BE]...
+fn parse_bip32_path(data: &[u8]) -> Option<Bip32Path> {
+    if data.is_empty() {
+        return None;
+    }
+    let depth = data[0] as usize;
+    if depth == 0 || depth > 10 || data.len() < 1 + depth * 4 {
+        return None;
+    }
+    let mut components = Vec::with_capacity(depth);
+    for i in 0..depth {
+        let offset = 1 + i * 4;
+        components.push(u32::from_be_bytes([
+            data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+        ]));
+    }
+    Some(Bip32Path::from_slice(&components))
+}
+
+/// Parse a BIP32 path and return remaining bytes.
+fn parse_bip32_path_and_remainder(data: &[u8]) -> Option<(Bip32Path, &[u8])> {
+    if data.is_empty() {
+        return None;
+    }
+    let depth = data[0] as usize;
+    let path_len = 1 + depth * 4;
+    if depth == 0 || depth > 10 || data.len() < path_len {
+        return None;
+    }
+    let path = parse_bip32_path(data)?;
+    Some((path, &data[path_len..]))
+}
+
+/// Build a signature response: [STATUS_OK, v: u64 LE, r: 32 bytes, s: 32 bytes]
+fn signature_response(sig: &Signature) -> Vec<u8> {
+    let mut out = vec![crate::serial::STATUS_OK];
+    out.extend_from_slice(&sig.v.to_le_bytes());
+    out.extend_from_slice(&sig.r);
+    out.extend_from_slice(&sig.s);
+    out
 }

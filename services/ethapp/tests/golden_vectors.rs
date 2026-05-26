@@ -5,102 +5,237 @@
 //! - EIP specifications
 //! - Ledger ethereum-app tests
 //!
-//! Run with: cargo test --test golden_vectors
+//! Tests use ethapp-common types directly since the ethapp service
+//! crate cannot compile on host until k256/bip32 are vendored.
+//!
+//! Run with: cargo test -p ethapp-common
 
+use ethapp_common::rlp;
+use ethapp_common::types::*;
+use ethapp_common::error::EthAppError;
 use hex_literal::hex;
 
 // =============================================================================
-// RLP Encoding Tests
+// RLP Encoding Tests (Ethereum Yellow Paper Appendix B)
 // =============================================================================
 
-mod rlp {
+mod rlp_spec {
     use super::*;
-
-    // Note: These tests would use the rlp module from ethapp
-    // For now we test basic encoding/decoding patterns
 
     #[test]
     fn test_rlp_empty_string() {
         // Empty string encodes to 0x80
-        let encoded = vec![0x80];
-        assert_eq!(encoded.len(), 1);
+        let encoded = rlp::encode_bytes(b"");
+        assert_eq!(encoded, vec![0x80]);
+
+        let item = rlp::decode_exact(&encoded).unwrap();
+        assert_eq!(item.as_string(), Some(&[][..]));
     }
 
     #[test]
     fn test_rlp_single_byte_below_0x80() {
         // Single byte < 0x80 encodes as itself
-        let value: u8 = 0x42;
-        assert!(value < 0x80);
+        let encoded = rlp::encode_bytes(&[0x42]);
+        assert_eq!(encoded, vec![0x42]);
+
+        let item = rlp::decode_exact(&encoded).unwrap();
+        assert_eq!(item.as_string(), Some(&[0x42][..]));
     }
 
     #[test]
-    fn test_rlp_short_string() {
+    fn test_rlp_single_byte_0x80() {
+        // Byte 0x80 requires prefix
+        let encoded = rlp::encode_bytes(&[0x80]);
+        assert_eq!(encoded, vec![0x81, 0x80]);
+    }
+
+    #[test]
+    fn test_rlp_short_string_cat() {
         // "cat" = [0x83, 0x63, 0x61, 0x74]
-        let expected = hex!("83636174");
-        assert_eq!(expected.len(), 4);
-        assert_eq!(expected[0], 0x80 + 3); // prefix = 0x80 + length
+        let encoded = rlp::encode_bytes(b"cat");
+        assert_eq!(encoded, hex!("83636174").to_vec());
+    }
+
+    #[test]
+    fn test_rlp_short_string_dog() {
+        // "dog" = [0x83, 0x64, 0x6f, 0x67]
+        let encoded = rlp::encode_bytes(b"dog");
+        assert_eq!(encoded, hex!("83646f67").to_vec());
     }
 
     #[test]
     fn test_rlp_empty_list() {
-        // Empty list = [0xc0]
-        let expected = hex!("c0");
-        assert_eq!(expected.len(), 1);
-        assert_eq!(expected[0], 0xc0);
+        let encoded = rlp::encode_list(&[]);
+        assert_eq!(encoded, vec![0xc0]);
+    }
+
+    #[test]
+    fn test_rlp_integer_zero() {
+        // Integer 0 encodes as empty string (0x80)
+        let encoded = rlp::encode_u64(0);
+        assert_eq!(encoded, vec![0x80]);
+
+        let item = rlp::decode_exact(&encoded).unwrap();
+        assert_eq!(item.as_u64(), Some(0));
+    }
+
+    #[test]
+    fn test_rlp_integer_15() {
+        let encoded = rlp::encode_u64(15);
+        assert_eq!(encoded, vec![0x0f]);
+
+        let item = rlp::decode_exact(&encoded).unwrap();
+        assert_eq!(item.as_u64(), Some(15));
+    }
+
+    #[test]
+    fn test_rlp_integer_1024() {
+        let encoded = rlp::encode_u64(1024);
+        assert_eq!(encoded, vec![0x82, 0x04, 0x00]);
+
+        let item = rlp::decode_exact(&encoded).unwrap();
+        assert_eq!(item.as_u64(), Some(1024));
+    }
+
+    #[test]
+    fn test_rlp_list_cat_dog() {
+        // ["cat", "dog"]
+        let mut items = Vec::new();
+        items.extend_from_slice(&rlp::encode_bytes(b"cat"));
+        items.extend_from_slice(&rlp::encode_bytes(b"dog"));
+        let encoded = rlp::encode_list(&items);
+
+        // Expected: 0xc8 0x83 "cat" 0x83 "dog"
+        assert_eq!(encoded, hex!("c88363617483646f67").to_vec());
     }
 
     #[test]
     fn test_rlp_nested_list() {
         // [[]] = [0xc1, 0xc0]
-        let expected = hex!("c1c0");
-        assert_eq!(expected.len(), 2);
+        let inner = rlp::encode_list(&[]);
+        let outer = rlp::encode_list(&inner);
+        assert_eq!(outer, hex!("c1c0").to_vec());
+    }
+
+    #[test]
+    fn test_rlp_non_canonical_rejection() {
+        // 0x81 0x42 is non-canonical (should be just 0x42)
+        let result = rlp::decode(&[0x81, 0x42]);
+        assert!(result.is_err());
     }
 }
 
 // =============================================================================
-// Transaction Hash Tests
+// Transaction Structure Tests
 // =============================================================================
 
 mod transactions {
     use super::*;
 
-    /// Test vector: Legacy transaction
-    /// From: https://etherscan.io/tx/0xabcd...
     #[test]
-    fn test_legacy_tx_hash() {
-        // Example legacy transaction RLP
-        // This is a simplified test - real tx would have all fields
-        let _tx_rlp = hex!(
-            "f86c" // list prefix
-            "09" // nonce
-            "8502540be400" // gas price: 10 gwei
-            "8252089417" // gas limit: 21000
-            "94" // address prefix (20 bytes)
-            "d8da6bf26964af9d7eed9e03e53415d37aa96045" // to address
-            "87038d7ea4c68000" // value: 0.001 ETH
-            "80" // data: empty
-            "01" // v = 1 (mainnet)
-            "a0" "0000000000000000000000000000000000000000000000000000000000000001" // r
-            "a0" "0000000000000000000000000000000000000000000000000000000000000002" // s
-        );
+    fn test_legacy_tx_rlp_structure() {
+        // Build unsigned legacy tx: [nonce, gasPrice, gasLimit, to, value, data]
+        let to_addr = hex!("d8da6bf26964af9d7eed9e03e53415d37aa96045"); // vitalik.eth
+        let mut fields = Vec::new();
+        fields.extend_from_slice(&rlp::encode_u64(9));              // nonce = 9
+        fields.extend_from_slice(&rlp::encode_u64(10_000_000_000)); // gasPrice = 10 gwei
+        fields.extend_from_slice(&rlp::encode_u64(21000));          // gasLimit
+        fields.extend_from_slice(&rlp::encode_bytes(&to_addr));     // to
+        fields.extend_from_slice(&rlp::encode_u64(1_000_000_000_000_000)); // 0.001 ETH
+        fields.extend_from_slice(&rlp::encode_bytes(&[]));          // data empty
+        let tx = rlp::encode_list(&fields);
 
-        // Note: In a real test we would compute hash and compare
+        let item = rlp::decode_exact(&tx).unwrap();
+        let list = item.as_list().unwrap();
+        assert_eq!(list.len(), 6);
+        assert_eq!(list[0].as_u64(), Some(9));     // nonce
+        assert_eq!(list[2].as_u64(), Some(21000)); // gasLimit
+        assert_eq!(list[3].as_address().unwrap(), to_addr);
     }
 
-    /// Test vector: EIP-1559 transaction
+    #[test]
+    fn test_eip155_unsigned_tx_structure() {
+        // EIP-155 unsigned: [nonce, gasPrice, gasLimit, to, value, data, chainId, 0, 0]
+        let mut fields = Vec::new();
+        fields.extend_from_slice(&rlp::encode_u64(0));
+        fields.extend_from_slice(&rlp::encode_u64(20_000_000_000));
+        fields.extend_from_slice(&rlp::encode_u64(21000));
+        fields.extend_from_slice(&rlp::encode_bytes(&[0xde; 20]));
+        fields.extend_from_slice(&rlp::encode_u64(1_000_000_000_000_000_000));
+        fields.extend_from_slice(&rlp::encode_bytes(&[]));
+        fields.extend_from_slice(&rlp::encode_u64(1));  // chainId = mainnet
+        fields.extend_from_slice(&rlp::encode_u64(0));  // r = 0
+        fields.extend_from_slice(&rlp::encode_u64(0));  // s = 0
+        let tx = rlp::encode_list(&fields);
+
+        let item = rlp::decode_exact(&tx).unwrap();
+        let list = item.as_list().unwrap();
+        assert_eq!(list.len(), 9);
+        assert_eq!(list[6].as_u64(), Some(1)); // chainId
+    }
+
     #[test]
     fn test_eip1559_tx_structure() {
-        // EIP-1559 transaction starts with 0x02
-        let tx_type: u8 = 0x02;
-        assert_eq!(tx_type, 2);
+        // EIP-1559: 0x02 || rlp([chainId, nonce, maxPriorityFee, maxFee, gasLimit, to, value, data, accessList])
+        let mut fields = Vec::new();
+        fields.extend_from_slice(&rlp::encode_u64(1));               // chainId
+        fields.extend_from_slice(&rlp::encode_u64(0));               // nonce
+        fields.extend_from_slice(&rlp::encode_u64(1_000_000_000));   // maxPriorityFee = 1 gwei
+        fields.extend_from_slice(&rlp::encode_u64(50_000_000_000));  // maxFee = 50 gwei
+        fields.extend_from_slice(&rlp::encode_u64(21000));           // gasLimit
+        fields.extend_from_slice(&rlp::encode_bytes(&[0xde; 20]));   // to
+        fields.extend_from_slice(&rlp::encode_u64(0));               // value
+        fields.extend_from_slice(&rlp::encode_bytes(&[]));           // data
+        fields.extend_from_slice(&rlp::encode_list(&[]));            // accessList (empty)
+        let rlp_payload = rlp::encode_list(&fields);
+
+        // Typed tx starts with 0x02
+        let mut tx = vec![0x02u8];
+        tx.extend_from_slice(&rlp_payload);
+
+        assert_eq!(tx[0], 0x02);
+        // The RLP payload should decode fine
+        let item = rlp::decode_exact(&rlp_payload).unwrap();
+        let list = item.as_list().unwrap();
+        assert_eq!(list.len(), 9);
+        assert_eq!(list[0].as_u64(), Some(1)); // chainId
     }
 
-    /// Test vector: EIP-2930 transaction
     #[test]
     fn test_eip2930_tx_structure() {
-        // EIP-2930 transaction starts with 0x01
-        let tx_type: u8 = 0x01;
-        assert_eq!(tx_type, 1);
+        // EIP-2930: 0x01 || rlp([chainId, nonce, gasPrice, gasLimit, to, value, data, accessList])
+        let mut fields = Vec::new();
+        fields.extend_from_slice(&rlp::encode_u64(1));
+        fields.extend_from_slice(&rlp::encode_u64(0));
+        fields.extend_from_slice(&rlp::encode_u64(20_000_000_000));
+        fields.extend_from_slice(&rlp::encode_u64(21000));
+        fields.extend_from_slice(&rlp::encode_bytes(&[0xde; 20]));
+        fields.extend_from_slice(&rlp::encode_u64(0));
+        fields.extend_from_slice(&rlp::encode_bytes(&[]));
+        fields.extend_from_slice(&rlp::encode_list(&[]));
+        let rlp_payload = rlp::encode_list(&fields);
+
+        let item = rlp::decode_exact(&rlp_payload).unwrap();
+        let list = item.as_list().unwrap();
+        assert_eq!(list.len(), 8);
+    }
+
+    #[test]
+    fn test_contract_creation_empty_to() {
+        // Contract creation has empty "to" field
+        let mut fields = Vec::new();
+        fields.extend_from_slice(&rlp::encode_u64(0));              // nonce
+        fields.extend_from_slice(&rlp::encode_u64(10_000_000_000)); // gasPrice
+        fields.extend_from_slice(&rlp::encode_u64(1_000_000));      // gasLimit (higher for deploy)
+        fields.extend_from_slice(&rlp::encode_bytes(&[]));           // to = empty (contract creation)
+        fields.extend_from_slice(&rlp::encode_u64(0));              // value
+        fields.extend_from_slice(&rlp::encode_bytes(&[0x60, 0x80, 0x60, 0x40])); // bytecode
+        let tx = rlp::encode_list(&fields);
+
+        let item = rlp::decode_exact(&tx).unwrap();
+        let list = item.as_list().unwrap();
+        // "to" field is empty string
+        assert_eq!(list[3].as_string(), Some(&[][..]));
     }
 }
 
@@ -111,115 +246,148 @@ mod transactions {
 mod signatures {
     use super::*;
 
-    /// Test EIP-155 v value calculation
     #[test]
     fn test_eip155_v_chain_1() {
-        // Chain ID 1 (Mainnet):
-        // v = chain_id * 2 + 35 + recovery_id
-        // v = 1 * 2 + 35 + 0 = 37
-        // v = 1 * 2 + 35 + 1 = 38
-        let chain_id: u64 = 1;
-        let v0 = chain_id * 2 + 35 + 0;
-        let v1 = chain_id * 2 + 35 + 1;
-
+        // Chain ID 1 (Mainnet): v = 1 * 2 + 35 + recovery_id
+        let v0 = 1u64 * 2 + 35 + 0;
+        let v1 = 1u64 * 2 + 35 + 1;
         assert_eq!(v0, 37);
         assert_eq!(v1, 38);
+
+        // Verify signature can store these values
+        let sig = Signature { v: v0, r: [1; 32], s: [2; 32] };
+        assert!(sig.to_bytes_legacy().is_some());
     }
 
     #[test]
     fn test_eip155_v_chain_56() {
-        // Chain ID 56 (BSC):
-        // v = 56 * 2 + 35 + 0 = 147
-        // v = 56 * 2 + 35 + 1 = 148
-        let chain_id: u64 = 56;
-        let v0 = chain_id * 2 + 35 + 0;
-        let v1 = chain_id * 2 + 35 + 1;
-
+        // Chain ID 56 (BSC): v = 56 * 2 + 35 + 0 = 147
+        let v0 = 56u64 * 2 + 35 + 0;
+        let v1 = 56u64 * 2 + 35 + 1;
         assert_eq!(v0, 147);
         assert_eq!(v1, 148);
+
+        let sig = Signature { v: v0, r: [0; 32], s: [0; 32] };
+        assert!(sig.to_bytes_legacy().is_some()); // 147 fits in u8
+    }
+
+    #[test]
+    fn test_eip155_v_chain_137() {
+        // Chain ID 137 (Polygon): v = 137 * 2 + 35 + 0 = 309
+        let v0 = 137u64 * 2 + 35 + 0;
+        assert_eq!(v0, 309);
+
+        let sig = Signature { v: v0, r: [0; 32], s: [0; 32] };
+        // 309 > 255, doesn't fit in legacy format
+        assert!(sig.to_bytes_legacy().is_none());
+        // But 72-byte format works
+        let bytes = sig.to_bytes();
+        let recovered = Signature::from_bytes(&bytes);
+        assert_eq!(recovered.v, 309);
     }
 
     #[test]
     fn test_legacy_v_no_chain_id() {
-        // Without chain ID:
-        // v = 27 + recovery_id
-        let v0: u8 = 27;
-        let v1: u8 = 28;
+        // Pre-EIP-155: v = 27 or 28
+        let sig27 = Signature { v: 27, r: [0xAA; 32], s: [0xBB; 32] };
+        let sig28 = Signature { v: 28, r: [0xCC; 32], s: [0xDD; 32] };
 
-        assert_eq!(v0, 27);
-        assert_eq!(v1, 28);
+        assert!(sig27.to_bytes_legacy().is_some());
+        assert!(sig28.to_bytes_legacy().is_some());
     }
 
     #[test]
     fn test_typed_tx_v() {
-        // For typed transactions (EIP-2930, EIP-1559):
-        // v = recovery_id (0 or 1)
-        let v0: u8 = 0;
-        let v1: u8 = 1;
+        // EIP-2930/1559: v = recovery_id (0 or 1)
+        for v in [0u64, 1] {
+            let sig = Signature { v, r: [0xFF; 32], s: [0xEE; 32] };
+            let bytes = sig.to_bytes();
+            let recovered = Signature::from_bytes(&bytes);
+            assert_eq!(recovered.v, v);
+        }
+    }
 
-        assert!(v0 == 0 || v0 == 1);
-        assert!(v1 == 0 || v1 == 1);
+    #[test]
+    fn test_signature_roundtrip_all_formats() {
+        let sig = Signature {
+            v: 27,
+            r: hex!("1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"),
+            s: hex!("fedcba0987654321fedcba0987654321fedcba0987654321fedcba0987654321"),
+        };
+
+        // 72-byte roundtrip
+        let bytes72 = sig.to_bytes();
+        assert_eq!(Signature::from_bytes(&bytes72), sig);
+
+        // 65-byte roundtrip
+        let bytes65 = sig.to_bytes_legacy().unwrap();
+        assert_eq!(bytes65[64], 27);
+        assert_eq!(&bytes65[0..32], &sig.r);
+        assert_eq!(&bytes65[32..64], &sig.s);
     }
 }
 
 // =============================================================================
-// Keccak256 Tests
+// Keccak256 Test Vectors
 // =============================================================================
 
-mod keccak {
+mod keccak_vectors {
     use super::*;
 
+    // Note: These are reference vectors. Actual keccak256 computation
+    // requires the ethapp service crate (tiny-keccak dep).
+
     #[test]
-    fn test_keccak256_empty() {
+    fn test_keccak256_empty_vector() {
         // keccak256("") = c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470
         let expected = hex!("c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470");
         assert_eq!(expected.len(), 32);
     }
 
     #[test]
-    fn test_keccak256_hello() {
+    fn test_keccak256_hello_vector() {
         // keccak256("hello") = 1c8aff950685c2ed4bc3174f3472287b56d9517b9c948127319a09a7a36deac8
         let expected = hex!("1c8aff950685c2ed4bc3174f3472287b56d9517b9c948127319a09a7a36deac8");
-        assert_eq!(expected.len(), 32);
-    }
-
-    #[test]
-    fn test_keccak256_hello_world() {
-        // keccak256("hello world")
-        let expected = hex!("47173285a8d7341e5e972fc677286384f802f8ef42a5ec5f03bbfa254cb01fad");
         assert_eq!(expected.len(), 32);
     }
 }
 
 // =============================================================================
-// Address Tests
+// Address Tests (EIP-55)
 // =============================================================================
 
 mod addresses {
     use super::*;
 
     #[test]
-    fn test_eip55_checksum_mixed_case() {
+    fn test_eip55_addresses_are_20_bytes() {
         // Test addresses from EIP-55
         let addr1 = hex!("5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed");
         let addr2 = hex!("fB6916095ca1df60bB79Ce92cE3Ea74c37c5d359");
         let addr3 = hex!("dbF03B407c01E7cD3CBea99509d93f8DDDC8C6FB");
         let addr4 = hex!("D1220A0cf47c7B9Be7A2E6BA89F429762e7b9aDb");
 
-        assert_eq!(addr1.len(), 20);
-        assert_eq!(addr2.len(), 20);
-        assert_eq!(addr3.len(), 20);
-        assert_eq!(addr4.len(), 20);
+        for addr in &[addr1, addr2, addr3, addr4] {
+            assert_eq!(addr.len(), 20);
+
+            // Verify RLP roundtrip
+            let encoded = rlp::encode_bytes(addr);
+            let item = rlp::decode_exact(&encoded).unwrap();
+            assert_eq!(item.as_address().unwrap(), *addr);
+        }
     }
 
     #[test]
-    fn test_address_derivation_from_pubkey() {
+    fn test_address_derivation_structure() {
         // Address = keccak256(pubkey[1..])[12..32]
-        // For uncompressed pubkey starting with 0x04
-        // We take bytes after prefix, hash, take last 20 bytes
-        let _address_len: usize = 20;
-        let _hash_len: usize = 32;
-        let _prefix_skip: usize = 12;
+        // Uncompressed pubkey is 65 bytes (0x04 || x[32] || y[32])
+        // Take last 20 bytes of keccak256(x || y)
+        let uncompressed_pubkey_len = 65usize;
+        let hash_len = 32usize;
+        let addr_offset = 12usize;
+        let addr_len = hash_len - addr_offset;
+        assert_eq!(addr_len, 20);
+        assert_eq!(uncompressed_pubkey_len - 1, 64); // skip 0x04 prefix
     }
 }
 
@@ -228,26 +396,26 @@ mod addresses {
 // =============================================================================
 
 mod personal_sign {
-    use super::*;
-
     #[test]
     fn test_eip191_prefix() {
-        // EIP-191 prefix: "\x19Ethereum Signed Message:\n"
         let prefix = b"\x19Ethereum Signed Message:\n";
         assert_eq!(prefix.len(), 26);
         assert_eq!(prefix[0], 0x19);
     }
 
     #[test]
-    fn test_personal_message_hash() {
+    fn test_personal_message_hash_structure() {
         // personal_sign("hello"):
         // hash = keccak256("\x19Ethereum Signed Message:\n5hello")
         let prefix = b"\x19Ethereum Signed Message:\n";
         let msg = b"hello";
-        let len_str = b"5";
+        let len_str = msg.len().to_string();
 
-        let total_len = prefix.len() + len_str.len() + msg.len();
-        assert_eq!(total_len, 26 + 1 + 5);
+        let mut preimage = Vec::new();
+        preimage.extend_from_slice(prefix);
+        preimage.extend_from_slice(len_str.as_bytes());
+        preimage.extend_from_slice(msg);
+        assert_eq!(preimage.len(), 26 + 1 + 5);
     }
 }
 
@@ -256,32 +424,13 @@ mod personal_sign {
 // =============================================================================
 
 mod eip712 {
-    use super::*;
-
-    #[test]
-    fn test_eip712_prefix() {
-        // EIP-712 prefix: 0x19 0x01
-        let prefix = [0x19u8, 0x01u8];
-        assert_eq!(prefix.len(), 2);
-    }
-
     #[test]
     fn test_eip712_hash_structure() {
         // hash = keccak256(0x19 || 0x01 || domainSeparator || hashStruct(message))
-        let prefix_len: usize = 2;
-        let domain_hash_len: usize = 32;
-        let message_hash_len: usize = 32;
-
-        let total_len = prefix_len + domain_hash_len + message_hash_len;
-        assert_eq!(total_len, 66);
-    }
-
-    #[test]
-    fn test_domain_separator_type() {
-        // EIP712Domain type hash
-        // keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")
-        let type_string = b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)";
-        assert!(type_string.len() > 0);
+        let prefix_len = 2usize;
+        let domain_hash_len = 32usize;
+        let message_hash_len = 32usize;
+        assert_eq!(prefix_len + domain_hash_len + message_hash_len, 66);
     }
 }
 
@@ -290,63 +439,69 @@ mod eip712 {
 // =============================================================================
 
 mod bip44 {
+    use super::*;
+
     #[test]
-    fn test_ethereum_path() {
-        // Standard Ethereum path: m/44'/60'/account'/change/address_index
-        const HARDENED: u32 = 0x80000000;
-
-        let purpose = 44 | HARDENED;
-        let coin_type = 60 | HARDENED;
-        let account = 0 | HARDENED;
-        let change = 0;
-        let address_index = 0;
-
-        assert_eq!(purpose, 0x8000002C);
-        assert_eq!(coin_type, 0x8000003C);
-        assert!(account & HARDENED != 0);
-        assert_eq!(change, 0);
-        assert_eq!(address_index, 0);
+    fn test_ethereum_path_standard() {
+        let path = Bip32Path::ethereum(0, 0, 0);
+        assert!(path.is_valid_ethereum_path());
+        assert_eq!(path.len(), 5);
     }
 
     #[test]
-    fn test_hardened_derivation() {
-        const HARDENED: u32 = 0x80000000;
+    fn test_ethereum_path_account_1() {
+        let path = Bip32Path::ethereum(1, 0, 0);
+        assert!(path.is_valid_ethereum_path());
+    }
 
-        // First 3 levels must be hardened
-        let level0 = 44 | HARDENED;
-        let level1 = 60 | HARDENED;
-        let level2 = 0 | HARDENED;
+    #[test]
+    fn test_ethereum_path_with_address_index() {
+        for idx in 0..10u32 {
+            let path = Bip32Path::ethereum(0, 0, idx);
+            assert!(path.is_valid_ethereum_path());
+            assert_eq!(path.as_slice()[4], idx);
+        }
+    }
 
-        assert!(level0 >= HARDENED);
-        assert!(level1 >= HARDENED);
-        assert!(level2 >= HARDENED);
+    #[test]
+    fn test_non_ethereum_paths_rejected() {
+        // Bitcoin path (coin_type = 0)
+        let btc = Bip32Path::from_slice(&[
+            44 | Bip32Path::HARDENED,
+            0 | Bip32Path::HARDENED,
+            0 | Bip32Path::HARDENED,
+        ]);
+        assert!(!btc.is_valid_ethereum_path());
+
+        // Solana path (coin_type = 501)
+        let sol = Bip32Path::from_slice(&[
+            44 | Bip32Path::HARDENED,
+            501 | Bip32Path::HARDENED,
+            0 | Bip32Path::HARDENED,
+        ]);
+        assert!(!sol.is_valid_ethereum_path());
     }
 }
 
 // =============================================================================
-// Known Test Wallet Tests
+// Error Type Tests
 // =============================================================================
 
-mod test_wallet {
+mod error_types {
     use super::*;
 
-    /// Standard test mnemonic: "abandon abandon ... about"
-    /// This is the standard 12-word test mnemonic used across implementations
     #[test]
-    fn test_mnemonic_derivation() {
-        // Expected address at m/44'/60'/0'/0/0 for test mnemonic:
-        // "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
-        // -> 0x9858EfFD232B4033E47d90003D41EC34EcaEda94
-        let expected_address = hex!("9858EfFD232B4033E47d90003D41EC34EcaEda94");
-        assert_eq!(expected_address.len(), 20);
-    }
+    fn test_security_vs_operational_errors() {
+        // Security errors should be distinguished from operational ones
+        assert!(EthAppError::SecurityViolation.is_security_error());
+        assert!(EthAppError::InvalidSignature.is_security_error());
+        assert!(EthAppError::BlindSigningDisabled.is_security_error());
+        assert!(EthAppError::InvalidDerivationPath.is_security_error());
 
-    /// Test seed from mnemonic (BIP39)
-    #[test]
-    fn test_seed_structure() {
-        // BIP39 seed is 64 bytes
-        let seed_len: usize = 64;
-        assert_eq!(seed_len, 64);
+        // These are NOT security errors
+        assert!(!EthAppError::Timeout.is_security_error());
+        assert!(!EthAppError::InternalError.is_security_error());
+        assert!(!EthAppError::RejectedByUser.is_security_error());
     }
 }
 
@@ -355,30 +510,47 @@ mod test_wallet {
 // =============================================================================
 
 mod values {
+    use super::*;
+
     #[test]
     fn test_wei_to_eth() {
-        // 1 ETH = 10^18 Wei
         let one_eth_in_wei: u128 = 1_000_000_000_000_000_000;
         assert_eq!(one_eth_in_wei, 10u128.pow(18));
     }
 
     #[test]
     fn test_gwei_to_wei() {
-        // 1 Gwei = 10^9 Wei
         let one_gwei_in_wei: u64 = 1_000_000_000;
         assert_eq!(one_gwei_in_wei, 10u64.pow(9));
     }
 
     #[test]
-    fn test_common_token_decimals() {
-        // Common token decimal values
-        let eth_decimals: u8 = 18;
-        let usdc_decimals: u8 = 6;
-        let wbtc_decimals: u8 = 8;
+    fn test_gas_values_fit_in_u64() {
+        // Common gas values should fit in u64
+        let base_gas: u64 = 21_000;
+        let typical_max_fee: u64 = 500_000_000_000; // 500 gwei
+        let typical_gas_limit: u64 = 1_000_000;
 
-        assert_eq!(eth_decimals, 18);
-        assert_eq!(usdc_decimals, 6);
-        assert_eq!(wbtc_decimals, 8);
+        assert!(base_gas < u64::MAX);
+        assert!(typical_max_fee < u64::MAX);
+        assert!(typical_gas_limit < u64::MAX);
+    }
+
+    #[test]
+    fn test_large_value_in_bytes32() {
+        // 1 ETH = 10^18 wei, should fit in bytes32
+        let one_eth_bytes = {
+            let val = 1_000_000_000_000_000_000u64;
+            let mut result = [0u8; 32];
+            result[24..32].copy_from_slice(&val.to_be_bytes());
+            result
+        };
+        // Verify it roundtrips through RLP
+        let trimmed = &one_eth_bytes[one_eth_bytes.iter().position(|&b| b != 0).unwrap_or(32)..];
+        let encoded = rlp::encode_bytes(trimmed);
+        let item = rlp::decode_exact(&encoded).unwrap();
+        let recovered = item.as_bytes32().unwrap();
+        assert_eq!(recovered, one_eth_bytes);
     }
 }
 
@@ -387,24 +559,40 @@ mod values {
 // =============================================================================
 
 mod chain_ids {
-    #[test]
-    fn test_common_chain_ids() {
-        let mainnet: u64 = 1;
-        let goerli: u64 = 5;
-        let sepolia: u64 = 11155111;
-        let polygon: u64 = 137;
-        let arbitrum: u64 = 42161;
-        let optimism: u64 = 10;
-        let bsc: u64 = 56;
-        let avalanche: u64 = 43114;
+    use super::*;
 
-        assert_eq!(mainnet, 1);
-        assert_eq!(goerli, 5);
-        assert!(sepolia > 0);
-        assert!(polygon > 0);
-        assert!(arbitrum > 0);
-        assert!(optimism > 0);
-        assert!(bsc > 0);
-        assert!(avalanche > 0);
+    #[test]
+    fn test_common_chain_ids_rlp() {
+        let chains: &[(u64, &str)] = &[
+            (1, "mainnet"),
+            (5, "goerli"),
+            (10, "optimism"),
+            (56, "bsc"),
+            (137, "polygon"),
+            (42161, "arbitrum"),
+            (43114, "avalanche"),
+            (11155111, "sepolia"),
+        ];
+
+        for &(chain_id, name) in chains {
+            let encoded = rlp::encode_u64(chain_id);
+            let item = rlp::decode_exact(&encoded).unwrap();
+            assert_eq!(item.as_u64(), Some(chain_id), "chain {name} roundtrip failed");
+        }
+    }
+
+    #[test]
+    fn test_eip155_v_extraction() {
+        // From a signed tx: extract chain_id from v value
+        // v = chain_id * 2 + 35 + recovery_id
+        // chain_id = (v - 35) / 2
+        let v_mainnet_0 = 37u64; // chain 1, recovery 0
+        let v_mainnet_1 = 38u64; // chain 1, recovery 1
+
+        assert_eq!((v_mainnet_0 - 35) / 2, 1);
+        assert_eq!((v_mainnet_1 - 35) / 2, 1);
+
+        let v_polygon_0 = 309u64; // chain 137, recovery 0
+        assert_eq!((v_polygon_0 - 35) / 2, 137);
     }
 }
