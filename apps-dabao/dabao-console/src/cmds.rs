@@ -94,6 +94,12 @@ mod ws2812;
 use ws2812::*;
 mod touch;
 use touch::*;
+mod eth;
+use eth::*;
+mod zec;
+use zec::*;
+mod seed;
+use seed::*;
 
 pub struct CmdEnv {
     common_env: CommonEnv,
@@ -106,6 +112,9 @@ pub struct CmdEnv {
     aes_cmd: Aes,
     ws2812_cmd: Ws2812,
     touch_cmd: Touch,
+    eth: Eth,
+    zec: Zec,
+    seed: Seed,
 }
 impl CmdEnv {
     pub fn new(xns: &xous_names::XousNames) -> CmdEnv {
@@ -134,6 +143,9 @@ impl CmdEnv {
             aes_cmd,
             ws2812_cmd: Ws2812::new(),
             touch_cmd: Touch::new(),
+            eth: Eth::new(),
+            zec: Zec::new(),
+            seed: Seed::new(),
         }
     }
 
@@ -162,6 +174,9 @@ impl CmdEnv {
             &mut self.aes_cmd,
             &mut self.ws2812_cmd,
             &mut self.touch_cmd,
+            &mut self.eth,
+            &mut self.zec,
+            &mut self.seed,
         ];
 
         if let Some(cmdline) = maybe_cmdline {

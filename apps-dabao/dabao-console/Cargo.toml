@@ -27,6 +27,10 @@ aes = { path = "../../services/aes", default-features = false, optional = true }
 xous-usb-hid = { git = "https://github.com/betrusted-io/xous-usb-hid.git", branch = "main", optional = true }
 
 bio-lib = { path = "../../libs/bio-lib" }
+ethapp-api = { path = "../../libs/ethapp-api" }
+zcashapp-api = { path = "../../libs/zcashapp-api" }
+bao-seed-api = { path = "../../libs/bao-seed-api" }
+hex-literal = "0.4"
 arbitrary-int = "1.2"
 
 # aes testing
