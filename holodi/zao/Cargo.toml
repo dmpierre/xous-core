@@ -1,0 +1,84 @@
+[package]
+name = "zao"
+version = "0.1.0"
+edition = "2021"
+description = "Host-side CLI for the Baochip-1x Zcash hardware wallet"
+
+[lib]
+name = "zao"
+path = "src/lib.rs"
+
+[[bin]]
+name = "zao"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+serialport = "4"
+hex = "0.4"
+anyhow = "1"
+rand_core = { version = "0.6", features = ["getrandom"] }
+rand = "0.8"
+qrcode = { version = "0.14", default-features = false }
+
+# Companion-wallet config: serde + toml for $DATADIR/config.toml
+serde = { version = "1", features = ["derive"] }
+toml = "0.7"
+dirs-next = "2"
+
+# Async / streaming helpers used by the sync loop (lightwalletd gRPC streams).
+futures-util = { version = "=0.3.32", default-features = false, features = ["alloc"] }
+prost = "0.14"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+sapling = { package = "sapling-crypto", version = "0.7" }
+
+# Async runtime (for lightwalletd gRPC)
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-std"] }
+
+# Zcash wallet stack (companion wallet functionality)
+zcash_client_backend = { version = "0.22", features = ["lightwalletd-tonic-transport", "lightwalletd-tonic-tls-webpki-roots", "orchard", "pczt"] }
+zcash_client_sqlite = { version = "0.20", features = ["orchard", "transparent-inputs", "unstable", "serde"] }
+zcash_keys = { version = "0.13", features = ["orchard"] }
+zcash_proofs = { version = "0.27", features = ["bundled-prover"] }
+tonic = { version = "0.14", features = ["tls-webpki-roots", "tls-ring"] }
+rusqlite = { version = "0.37", features = ["time"] }
+
+# Zcash deps for PCZT construction + signing
+orchard = "0.13"
+pczt = { version = "0.6", features = ["orchard", "signer", "io-finalizer", "zcp-builder"] }
+zcash_primitives = "0.27"
+zcash_protocol = "0.8"
+zcash_address = "0.11"
+zcash_note_encryption = "0.4"
+incrementalmerkletree = "0.8"
+zip32 = "0.2"
+zip321 = "0.7"
+sha2 = "0.10"
+hmac = "0.12"
+pbkdf2 = "0.12"
+
+# Used by the `send` wrapper to pipe pipeline stages through temp files.
+tempfile = "3"
+
+# TUI (`zao ui` subcommand) — chat-style slash-command palette over
+# the same `cmd_*` handlers the CLI uses. `tui-textarea` provides a
+# hardened input widget (bracketed-paste, cursor nav, history); `shh`
+# redirects stdout for the duration of an in-process `cmd_*` call so
+# its `println!`s are captured into the transcript instead of writing
+# straight to the terminal.
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["bracketed-paste"] }
+tui-textarea = { version = "0.7", features = ["crossterm"], default-features = false }
+
+# Unix-only: termios for no-echo `import-mnemonic` prompt.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+hex-literal = "0.4"
+
+# `[patch.crates-io]` is declared once at the workspace root
+# (holodi/Cargo.toml) and applies to every member, so zao doesn't need
+# its own [patch] block.
