@@ -125,6 +125,20 @@ members = [
   "bao1x-boot/sha2-bao1x",
   "apps-dabao/helloworld",
   "apps-dabao/dabao-console",
+  "apps-dabao/ethapp-test",
+  "apps-dabao/zcashapp-test",
+  "apps-dabao/bao-seed-test",
+  "apps-dabao/usb-serial-test",
+  "services/ethapp",
+  "libs/ethapp-api",
+  "libs/ethapp-common",
+  "services/zcashapp",
+  "libs/zcashapp-api",
+  "libs/zcashapp-common",
+  "services/bao-seed",
+  "libs/bao-seed-api",
+  "libs/bao-seed-common",
+  "libs/bip39-utils",
   "services/swaptest1",
   "services/swaptest2",
 ]
@@ -192,6 +206,16 @@ path = "imports/getrandom"
 # path = "../ring-xous" # for local dev only
 git = "https://github.com/betrusted-io/ring-xous"
 rev = "5f86cb10bebd521a45fb3abb06995200aeda2948"  # use the commitref because we're still updating the branch
+
+# Local pczt fork — adds Bundle::set_spend_auth_sig so the firmware sign
+# path can install a signature without going through the high-allocation
+# clone + into_parsed + serialize_from pattern that triggers RV32 heap
+# corruption of action[1].enc_ciphertext. See
+# `services/zcashapp/src/signing.rs::sign_pczt` for the use site and
+# `zcashapp_multi_recv_corruption.md` (in agent memory) for the
+# investigation that led here.
+[patch.crates-io.pczt]
+path = "imports/pczt"
 #branch="0.16.20-cleanup"
 
 ######################################################
