@@ -31,6 +31,20 @@ enum SerialListenMode {
     ConsoleListener,
 }
 
+/// State machine for parsing app serial frames (0xE7 ethapp, 0xE8 zcashapp).
+#[cfg(target_os = "xous")]
+#[derive(Debug)]
+enum AppFrameState {
+    /// Not parsing a frame (normal console mode).
+    Idle,
+    /// Got magic byte, waiting for length low byte.
+    LengthLow(u8),
+    /// Got length low byte, waiting for length high byte.
+    LengthHigh(u8, u8),
+    /// Reading payload bytes (magic, expected total length).
+    Payload(u8, usize),
+}
+
 fn main() -> ! {
     #[cfg(target_os = "xous")]
     main_hw();
@@ -155,6 +169,12 @@ pub(crate) fn main_hw() -> ! {
     let mut serial_listen_mode: SerialListenMode = SerialListenMode::NoListener;
     let mut serial_buf = Vec::<u8>::new();
     let mut serial_rx_trigger = false; // when true, the condition was met to pass data to the listener (but the listener was not yet installed)
+
+    // Ethapp serial frame state
+    let mut app_frame_state: AppFrameState = AppFrameState::Idle;
+    let mut app_frame_buf: Vec<u8> = Vec::new();
+    let mut ethapp_conn: Option<xous::CID> = None;
+    let mut zcashapp_conn: Option<xous::CID> = None;
 
     // under the theory that PIDs cannot be forged.
     // also if someone commandeers a process, all bets are off within that process (this is a general
@@ -596,14 +616,126 @@ pub(crate) fn main_hw() -> ! {
                             serial_buf.clear();
                         }
                         SerialListenMode::ConsoleListener => {
-                            match std::str::from_utf8(&serial_buf) {
-                                Ok(s) => {
+                            // Process bytes one at a time to detect app binary frames
+                            // (0xE7 = ethapp, 0xE8 = zcashapp).
+                            let mut text_start = 0;
+                            let buf_snapshot = serial_buf.clone();
+                            for (i, &byte) in buf_snapshot.iter().enumerate() {
+                                match &app_frame_state {
+                                    AppFrameState::Idle => {
+                                        if byte == 0xE7 || byte == 0xE8 {
+                                            // Flush any accumulated text bytes first
+                                            if text_start < i {
+                                                if let Ok(s) = std::str::from_utf8(&buf_snapshot[text_start..i]) {
+                                                    for c in s.chars() {
+                                                        native_kbd.inject_key(c);
+                                                    }
+                                                }
+                                            }
+                                            app_frame_buf.clear();
+                                            app_frame_state = AppFrameState::LengthLow(byte);
+                                            text_start = buf_snapshot.len(); // skip rest for text
+                                        }
+                                        // else: normal text byte, will be flushed later
+                                    }
+                                    AppFrameState::LengthLow(magic) => {
+                                        app_frame_state = AppFrameState::LengthHigh(*magic, byte);
+                                    }
+                                    AppFrameState::LengthHigh(magic, low) => {
+                                        let length = (*low as usize) | ((byte as usize) << 8);
+                                        let max_len = if *magic == 0xE8 {
+                                            zcashapp_common::MAX_FRAME_SIZE
+                                        } else {
+                                            8192
+                                        };
+                                        if length == 0 || length > max_len {
+                                            log::warn!("app frame: bad length {}", length);
+                                            app_frame_state = AppFrameState::Idle;
+                                            text_start = i + 1;
+                                        } else {
+                                            app_frame_state = AppFrameState::Payload(*magic, length);
+                                        }
+                                    }
+                                    AppFrameState::Payload(magic, expected) => {
+                                        let magic = *magic;
+                                        app_frame_buf.push(byte);
+                                        if app_frame_buf.len() >= *expected {
+                                            // Complete frame received — dispatch based on magic
+                                            let frame_data = std::mem::take(&mut app_frame_buf);
+                                            app_frame_state = AppFrameState::Idle;
+                                            text_start = i + 1;
+
+                                            if magic == 0xE7 {
+                                                // Dispatch to ethapp
+                                                if ethapp_conn.is_none() {
+                                                    if let Ok(conn) = xns.request_connection_blocking(
+                                                        ethapp_common::SERVER_NAME
+                                                    ) {
+                                                        ethapp_conn = Some(conn);
+                                                    }
+                                                }
+                                                if let Some(conn) = ethapp_conn {
+                                                    let request = ethapp_common::SerialFrameData {
+                                                        data: frame_data,
+                                                    };
+                                                    let mut buf = xous_ipc::Buffer::new(8192);
+                                                    if buf.replace(request).is_ok() {
+                                                        let opcode = ethapp_common::EthAppOp::SerialFrame;
+                                                        if buf.lend_mut(conn, num_traits::ToPrimitive::to_u32(&opcode).unwrap()).is_ok() {
+                                                            if let Ok(resp) = buf.to_original::<ethapp_common::SerialFrameData, _>() {
+                                                                let resp_len = resp.data.len() as u16;
+                                                                let mut frame = Vec::with_capacity(3 + resp.data.len());
+                                                                frame.push(0xE7);
+                                                                frame.extend_from_slice(&resp_len.to_le_bytes());
+                                                                frame.extend_from_slice(&resp.data);
+                                                                for chunk in frame.chunks(crate::hw::SERIAL_MAX_PACKET_SIZE) {
+                                                                    cu.serial_port.write(chunk).ok();
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            } else if magic == 0xE8 {
+                                                // Dispatch to zcashapp
+                                                if zcashapp_conn.is_none() {
+                                                    if let Ok(conn) = xns.request_connection_blocking(
+                                                        zcashapp_common::SERVER_NAME
+                                                    ) {
+                                                        zcashapp_conn = Some(conn);
+                                                    }
+                                                }
+                                                if let Some(conn) = zcashapp_conn {
+                                                    let request = zcashapp_common::SerialFrameData {
+                                                        data: frame_data,
+                                                    };
+                                                    let mut buf = xous_ipc::Buffer::new(zcashapp_common::MAX_FRAME_SIZE);
+                                                    if buf.replace(request).is_ok() {
+                                                        let opcode = zcashapp_common::ZcashAppOp::SerialFrame;
+                                                        if buf.lend_mut(conn, num_traits::ToPrimitive::to_u32(&opcode).unwrap()).is_ok() {
+                                                            if let Ok(resp) = buf.to_original::<zcashapp_common::SerialFrameData, _>() {
+                                                                let resp_len = resp.data.len() as u16;
+                                                                let mut frame = Vec::with_capacity(3 + resp.data.len());
+                                                                frame.push(0xE8);
+                                                                frame.extend_from_slice(&resp_len.to_le_bytes());
+                                                                frame.extend_from_slice(&resp.data);
+                                                                for chunk in frame.chunks(crate::hw::SERIAL_MAX_PACKET_SIZE) {
+                                                                    cu.serial_port.write(chunk).ok();
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            // Flush remaining text bytes
+                            if matches!(app_frame_state, AppFrameState::Idle) && text_start < buf_snapshot.len() {
+                                if let Ok(s) = std::str::from_utf8(&buf_snapshot[text_start..]) {
                                     for c in s.chars() {
                                         native_kbd.inject_key(c);
                                     }
-                                }
-                                Err(_) => {
-                                    log::info!("Non UTF-8 received on console: {:x?}", &serial_buf);
                                 }
                             }
                             serial_buf.clear();
