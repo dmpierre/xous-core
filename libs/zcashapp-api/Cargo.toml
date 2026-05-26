@@ -1,0 +1,21 @@
+[package]
+name = "zcashapp-api"
+version = "0.1.0"
+edition = "2021"
+description = "Client API for the Zcash hardware wallet service"
+license = "Apache-2.0 OR MIT"
+
+[dependencies]
+zcashapp-common = { path = "../zcashapp-common" }
+log = "0.4.14"
+num-traits = { version = "0.2.14", default-features = false }
+
+# Xous deps — unconditional so they're available in hosted-dabao mode too.
+# In pure host test builds, the mock path is used instead.
+xous = "0.9.70"
+xous-ipc = "0.10.10"
+xous-names = { package = "xous-api-names", version = "0.9.71" }
+
+[features]
+default = []
+hosted-dabao = []
