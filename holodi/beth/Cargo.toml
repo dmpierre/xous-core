@@ -1,0 +1,48 @@
+[package]
+name = "beth"
+version = "0.1.0"
+edition = "2021"
+description = "Host-side CLI for the Baochip-1x Ethereum hardware wallet"
+
+[lib]
+name = "beth"
+path = "src/lib.rs"
+
+[[bin]]
+name = "beth"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+# Default features include libudev on Linux for USB VID/PID auto-detect.
+# The flake.nix dev shells provide pkg-config + systemd (libudev) on Linux.
+serialport = "4"
+hex = "0.4"
+anyhow = "1"
+# JSON-RPC client for chain queries. Uses rustls (no openssl system dep).
+ureq = { version = "2", features = ["json", "tls"] }
+serde_json = "1"
+# For verify-attestation (offline signature verification)
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "ecdh", "arithmetic"] }
+tiny-keccak = { version = "2.0", features = ["keccak"] }
+# For encrypted mnemonic import (ECIES)
+chacha20poly1305 = "0.10"
+sha2 = "0.10"
+hkdf = "0.12"
+rand_core = { version = "0.6", features = ["getrandom"] }
+# For QR code display in terminal
+qrcode = { version = "0.14", default-features = false }
+
+# TUI (`beth ui` subcommand) — chat-style slash-command palette over the
+# same `cmd_*` handlers the CLI uses. `tui-textarea` provides a hardened
+# input widget (bracketed-paste, cursor nav, history). Stdout/stderr from
+# each in-process `cmd_*` call are captured via a libc pipe so their
+# `println!`s land in the transcript instead of corrupting the alt-screen.
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["bracketed-paste"] }
+tui-textarea = { version = "0.7", features = ["crossterm"], default-features = false }
+dirs-next = "2"
+
+# Unix-only: libc for the TUI's stdout/stderr pipe redirection.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
