@@ -1,0 +1,85 @@
+[package]
+name = "zcashapp"
+version = "0.1.0"
+edition = "2021"
+description = "Zcash shielded transaction signing service for Xous on Baochip-1x"
+license = "Apache-2.0 OR MIT"
+
+[[bin]]
+name = "zcashapp"
+path = "src/main.rs"
+
+[dependencies]
+# Xous core
+xous = "0.9.70"
+xous-ipc = "0.10.10"
+xous-names = { package = "xous-api-names", version = "0.9.71" }
+log-server = { package = "xous-api-log", version = "0.1.69" }
+log = "0.4.14"
+
+# Common types
+zcashapp-common = { path = "../../libs/zcashapp-common" }
+
+# Serialization
+rkyv = { version = "0.8.8", default-features = false, features = ["std", "alloc"] }
+
+# Numeric conversions
+num-traits = { version = "0.2.14", default-features = false }
+num-derive = { version = "0.4.2", default-features = false }
+
+# Cryptography — Zcash-specific
+pczt = { version = "0.6", default-features = false, features = ["orchard"] }
+orchard = { version = "0.13", default-features = false }
+pasta_curves = { version = "0.5", default-features = false }
+reddsa = { version = "0.5", default-features = false }
+
+# ZIP-32 key derivation types
+zip32 = { version = "0.2", default-features = false }
+
+# Cryptography — shared with ethapp
+sha2 = { version = "0.10.8" }
+blake2 = { version = "0.10", default-features = false }
+# blake2b_simd is the BLAKE2b implementation used by ZIP-244 personalization.
+# It's already pulled in transitively by `orchard`/`pczt`, so adding it as a
+# direct dep costs zero new transitive crates.
+blake2b_simd = { version = "1", default-features = false }
+hmac = { version = "0.12", default-features = false }
+pbkdf2 = { version = "0.12", default-features = false }
+zeroize = { version = "1.7.0", features = ["zeroize_derive"] }
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+
+# BIP39 mnemonic utilities
+bip39-utils = { path = "../../libs/bip39-utils" }
+
+# Seed vault — owns the seed and the Orchard signing primitives.
+bao-seed-api = { path = "../../libs/bao-seed-api" }
+bao-seed-common = { path = "../../libs/bao-seed-common" }
+
+# Hex encoding
+hex = { version = "0.4.3", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+hex-literal = "0.4"
+# Heavy deps for constructing test PCZTs (not included in firmware).
+# Feature unification only affects `cargo test`, not the firmware build.
+pczt = { version = "0.6", features = ["zcp-builder", "orchard", "signer", "io-finalizer"] }
+zcash_primitives = "0.27"
+zcash_protocol = "0.8"
+zcash_note_encryption = "0.4"
+incrementalmerkletree = "0.8"
+
+[target.'cfg(target_os = "xous")'.dependencies]
+trng = { path = "../trng" }
+pddb = { path = "../pddb", optional = true }
+
+[target.'cfg(not(target_os = "xous"))'.dependencies]
+getrandom = { version = "0.2", default-features = false, features = ["std"] }
+
+[features]
+default = []
+dev-mode = []
+autoapprove = []
+testnet = []
+bao1x = []
+board-dabao = []
+hosted-dabao = []
