@@ -370,8 +370,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "bao1x-emu",
                 "bao-console",
                 "modals",
+                "bao-seed",
+                "ethapp",
+                "zcashapp",
             ];
-            builder.target_hosted_dabao().add_services(&bao_pkgs).add_apps(&get_cratespecs());
+            builder.target_hosted_dabao()
+                .add_services(&bao_pkgs)
+                .add_apps(&get_cratespecs())
+                .add_feature("ethapp/dev-mode")
+                .add_feature("ethapp/autoapprove")
+                .add_feature("zcashapp/dev-mode")
+                .add_feature("zcashapp/autoapprove");
+                // NOTE: ethapp/pddb not available on dabao (no SPI flash)
 
             unsafe {
                 std::env::set_var("UUID", "1234567812345678123456781234567812345678123456781234567812345678");
@@ -841,7 +851,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // minimal set of services for app development on a dabao. Need to save space for the app itself!
             let bao_rram_pkgs =
-                ["xous-ticktimer", "keystore", "xous-log", "xous-names", "usb-bao1x", "bao1x-hal-service"]
+                ["xous-ticktimer", "keystore", "xous-log", "xous-names", "usb-bao1x", "bao1x-hal-service", "bao-seed", "ethapp", "zcashapp"]
                     .to_vec();
             let bao_app_pkgs: Vec<&'static str> = [].to_vec();
 
@@ -849,6 +859,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             builder.add_kernel_feature("v2p");
             builder.add_kernel_feature("print-panics");
             builder.add_kernel_feature("debug-proc");
+            // TODO: remove dev-mode and autoapprove for production builds
+            builder.add_feature("ethapp/dev-mode");
+            builder.add_feature("ethapp/autoapprove");
+            builder.add_feature("zcashapp/dev-mode");
+            builder.add_feature("zcashapp/autoapprove");
+            // NOTE: ethapp/pddb cannot be enabled on dabao — it lacks external
+            // SPI flash required by PDDB. Seed is in-memory only (lost on reboot).
+            // PDDB will be available on baosec and other flash-equipped boards.
             match task.as_deref() {
                 Some("dabao") => builder.target_bao1x_soc(),
                 _ => panic!("should be unreachable"),
