@@ -1,0 +1,37 @@
+[package]
+name = "holodi"
+version = "0.1.0"
+edition = "2021"
+description = "Unified host CLI for the Baochip hardware wallet (seed, eth, zec)"
+# build.rs is auto-detected when present. The version string falls back
+# via `option_env!` + `CARGO_PKG_VERSION` in main.rs, so the crate
+# still compiles on checkouts where build.rs is missing.
+
+[[bin]]
+name = "holodi"
+path = "src/main.rs"
+
+# Short-form: users can `alias lodi=holodi` in their shell, or we install
+# a symlink alongside the binary. Avoids the cargo warning from declaring
+# two bin targets with the same source.
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+serialport = "4"
+hex = "0.4"
+anyhow = "1"
+
+# Link beth and zao as libraries so `holodi eth …` / `holodi zec …`
+# dispatch in-process — no PATH dep, no exec spawn. Each tool exposes
+# a `pub fn run_from_argv(argv)` from its `lib.rs`. Workspace siblings.
+beth = { path = "../beth" }
+zao  = { path = "../zao" }
+
+# Unix-only: termios for the no-echo `seed import` prompt.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# `[patch.crates-io]` is declared once at the workspace root
+# (holodi/Cargo.toml) and applies to every member, so this crate
+# doesn't need its own [patch] block.

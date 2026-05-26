@@ -1,0 +1,37 @@
+# Holodi workspace — the host-side companion suite for the Baochip
+# hardware wallet. Members:
+#
+#   cli   — the `holodi` unified front-end binary; links beth + zao as
+#           libraries and dispatches `holodi {seed,eth,zec}` in-process.
+#   beth  — Baochip-1x Ethereum hardware wallet CLI (library + thin bin)
+#   zao   — Baochip-1x Zcash hardware wallet CLI (library + thin bin)
+#
+# All three previously lived as standalone Cargo workspaces. Consolidated
+# 2026-05-14 because:
+#
+#   - cli (holodi) path-deps beth + zao, so they're effectively one dep
+#     graph; one Cargo.lock removes drift between the three.
+#   - The Nix vendor build needs one `vendoredHolodiDeps` derivation
+#     instead of three.
+#   - The `[patch.crates-io]` pczt fork (Path 2b on the multi-recv
+#     corruption resolution) only needs to be declared once here at the
+#     workspace root, instead of mirrored across two members.
+#
+# Firmware crates stay under `services/`/`libs/` and use the top-level
+# xous-core workspace (cross-compiled to riscv32imac-unknown-xous-elf).
+# This workspace is host-only (x86_64 / aarch64).
+
+[workspace]
+members = ["beth", "zao", "cli"]
+resolver = "2"
+
+# Vendored pczt fork — needed by zao's `send::sign` for the
+# `Bundle::set_spend_auth_sig` setter that lets us apply device-supplied
+# raw signatures locally (Path 2b on the multi-recv corruption resolution;
+# see memory: zcashapp_multi_recv_corruption.md).
+#
+# `[patch.crates-io]` at a workspace root applies to every member, so a
+# single declaration here covers beth (which doesn't depend on pczt),
+# zao, and cli.
+[patch.crates-io]
+pczt = { path = "../imports/pczt" }
