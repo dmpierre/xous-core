@@ -62,7 +62,7 @@ their own sandboxed vendoring.
 | `dabao-ethapp` | `make dabao-ethapp` |
 | `baosec` | `make baosec` |
 | `bootloader` | `make bootloader` |
-| `ethcli` | `make ethcli` |
+| `beth` | `make beth` |
 
 ## Options
 
@@ -91,7 +91,7 @@ The baobit channel (`github.com/sbellem/baobit`) provides the Rust toolchain
       bao.scm                # Firmware package definitions (shared with baobit)
       bao-crates.scm         # Crate + git dependency origins (shared with baobit)
       bao-config.scm         # Dev config (local-file source, git-describe version)
-      ethcli.scm              # Host CLI package (ethcli)
+      beth.scm              # Host CLI package (beth)
       bao-vendor.scm         # Offline vendor packages (xous-vendor-deps, xous-vendor-setup, xous-build)
       firmware-manifest.scm  # All firmware packages for `make firmware`
 

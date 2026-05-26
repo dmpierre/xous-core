@@ -17,6 +17,9 @@ DRY ?=
 ROOT ?=
 CHECK ?=
 
+# GC root directory (prevents guix gc from removing pinned environments)
+GCROOT_DIR := ../.guix-gcroots
+
 # Substitute URL definitions
 SUBS_OFFICIAL   := https://ci.guix.gnu.org https://bordeaux.guix.gnu.org
 SUBS_BAOBIT     := https://guix.baobit.one
@@ -67,12 +70,13 @@ VENDOR_CFG      := ../.cargo/vendor-config.toml
 .PHONY: help shell \
         rv32imac-none rv32imac-xous toolchain \
         boot0 boot1 alt-boot1 bootloader baremetal-dabao \
-        dabao dabao-helloworld dabao-ethapp baosec firmware ethcli \
+        dabao dabao-helloworld dabao-ethapp baosec firmware beth \
         rustfilt boot0-elf-analysis boot1-elf-analysis \
         alt-boot1-elf-analysis baremetal-dabao-elf-analysis \
         dabao-elf-analysis baosec-elf-analysis \
         all-dry dry-toolchain \
-        vendor-setup vendor-clean
+        vendor-setup vendor-clean \
+        pin-shell pin unpin
 
 help:
 	@echo "Targets:"
@@ -86,12 +90,16 @@ help:
 	@echo "    boot0 boot1 alt-boot1 baremetal-dabao"
 	@echo "    dabao dabao-helloworld dabao-ethapp baosec"
 	@echo "  Host tools:"
-	@echo "    ethcli             - Ethereum wallet CLI (host binary)"
+	@echo "    beth               - Ethereum wallet CLI (host binary)"
 	@echo "    bootloader         - all bootloaders (boot0 + boot1 + alt-boot1)"
 	@echo "    firmware           - all firmware (via manifest)"
 	@echo "  Offline development:"
 	@echo "    vendor-setup       - vendor deps for offline cargo xtask"
 	@echo "    vendor-clean       - remove vendored deps and restore config"
+	@echo "  GC roots (survive guix gc):"
+	@echo "    pin-shell          - pin shell environment"
+	@echo "    pin                - pin shell + toolchain + firmware"
+	@echo "    unpin              - remove all GC roots"
 	@echo "  ELF analysis (for debugging panics):"
 	@echo "    rustfilt                       - build rustfilt demangler"
 	@echo "    boot0-elf-analysis             - assembly listing for boot0"
@@ -151,8 +159,8 @@ dabao-helloworld:
 dabao-ethapp:
 	$(TM) -e '(@ (bao) dabao-ethapp)'
 
-ethcli:
-	$(TM) -e '(@ (ethcli) ethcli)'
+beth:
+	$(TM) -e '(@ (beth) beth)'
 
 baosec:
 	$(TM) -e '(@ (bao) baosec)'
@@ -188,6 +196,24 @@ all-dry:
 
 dry-toolchain:
 	$(MAKE) DRY=1 toolchain
+
+# GC roots — pin environments so guix gc won't remove their dependencies
+pin-shell:
+	@mkdir -p $(GCROOT_DIR)
+	cd .. && guix time-machine --channels=channels.scm -- shell \
+		-m manifest.scm $(_SHELL_SUBS) --root=.guix-gcroots/shell -- true
+	@echo "Shell environment pinned at $(GCROOT_DIR)/shell"
+
+pin: pin-shell
+	@mkdir -p $(GCROOT_DIR)
+	$(TM) --root=$(GCROOT_DIR)/toolchain -e '(@ (rust-xous-toolchain) rust-xous-toolchain)'
+	guix time-machine --channels=$(CHANNELS) -- build -L . -m firmware-manifest.scm \
+		$(if $(_SUBS),--substitute-urls="$(_SUBS)") --root=$(GCROOT_DIR)/firmware
+	@echo "All environments pinned at $(GCROOT_DIR)/"
+
+unpin:
+	rm -f $(GCROOT_DIR)/shell $(GCROOT_DIR)/toolchain $(GCROOT_DIR)/firmware
+	@echo "GC roots removed. Next guix gc will reclaim these packages."
 
 # Offline vendor setup
 vendor-setup:
