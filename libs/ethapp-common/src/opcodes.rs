@@ -105,6 +105,71 @@ pub enum EthAppOp {
     /// Returns: 20-byte address.
     GetAddress = 0x51,
 
+    // === Seed Management (0x60-0x6F) ===
+
+    /// Import a 64-byte seed for key derivation.
+    /// Input: 64 bytes via memory message.
+    /// Returns: success or error.
+    SetSeed = 0x60,
+
+    /// Import a BIP39 mnemonic and derive the seed via PBKDF2.
+    /// Input: mnemonic string via memory message.
+    /// Returns: success or error.
+    ImportMnemonic = 0x61,
+
+    /// Generate a new 24-word BIP39 mnemonic from TRNG entropy.
+    /// Words are displayed on device screen only (never sent over USB).
+    /// Returns: success or error via scalar.
+    GenerateMnemonic = 0x62,
+
+    /// Wipe the master seed from memory and persistent storage.
+    /// Requires user confirmation.
+    /// Returns: success or error via scalar.
+    ClearSeed = 0x63,
+
+    /// DANGEROUS: enable mainnet signing on displayless dev builds.
+    /// This is a session-only flag (resets on reboot). Only effective
+    /// when autoapprove or dev-mode features are compiled in.
+    /// Returns: success via scalar.
+    EnableDangerousMainnet = 0x64,
+
+    /// Initialize the import keypair (one-time secp256k1 keypair for ECIES).
+    /// Input: InitImportKeyRequest via memory message.
+    /// Returns: success or ImportKeyExists error.
+    InitImportKey = 0x65,
+
+    /// Get the import public key (33-byte compressed secp256k1).
+    /// Returns: ImportKeyResponse via memory message.
+    GetImportKey = 0x66,
+
+    /// Import a mnemonic encrypted with ECIES to the import public key.
+    /// Input: [e_pub:33][ciphertext+tag] via memory message.
+    /// Returns: success or DecryptionFailed error.
+    ImportEncrypted = 0x67,
+
+    // === Attestation (0x80-0x8F) ===
+
+    /// Initialize device attestation identity (one-time keypair generation).
+    /// Input: InitAttestationRequest via memory message.
+    /// Returns: success or AttestationKeyExists error.
+    InitAttestation = 0x80,
+
+    /// Get the attestation public key (33-byte compressed secp256k1).
+    /// Returns: AttestationKeyResponse via memory message.
+    GetAttestationKey = 0x81,
+
+    /// Sign a transaction AND produce an attestation co-signature.
+    /// Input: SignTransactionRequest via memory message.
+    /// Returns: AttestedSignature (tx sig + attestation sig) via memory message.
+    AttestSign = 0x82,
+
+    // === Serial Transport (0x70-0x7F) ===
+
+    /// Process a raw serial frame from the host CLI.
+    /// Input: [opcode: u8][payload...] via memory message.
+    /// Returns: [status: u8][payload...] via memory message.
+    SerialFrame = 0x70,
+
     // === Internal/Debug (0xF0-0xFF) ===
 
     /// Clear all cached metadata.
@@ -168,5 +233,85 @@ mod tests {
         assert!(!ChunkFlags::First.is_last());
         assert!(ChunkFlags::Single.is_first());
         assert!(ChunkFlags::Single.is_last());
+    }
+
+    #[test]
+    fn test_chunk_flags_continue() {
+        assert!(!ChunkFlags::Continue.is_first());
+        assert!(!ChunkFlags::Continue.is_last());
+    }
+
+    #[test]
+    fn test_chunk_flags_last() {
+        assert!(!ChunkFlags::Last.is_first());
+        assert!(ChunkFlags::Last.is_last());
+    }
+
+    #[test]
+    fn test_opcode_ranges() {
+        // Config commands: 0x01-0x0F
+        assert_eq!(EthAppOp::GetAppConfiguration.to_u32().unwrap(), 0x01);
+        assert_eq!(EthAppOp::Exit.to_u32().unwrap(), 0x0F);
+
+        // Transaction signing: 0x10-0x1F
+        assert_eq!(EthAppOp::SignTransaction.to_u32().unwrap(), 0x10);
+        assert_eq!(EthAppOp::ClearSignTransaction.to_u32().unwrap(), 0x11);
+
+        // Message signing: 0x20-0x2F
+        assert_eq!(EthAppOp::SignPersonalMessage.to_u32().unwrap(), 0x20);
+        assert_eq!(EthAppOp::SignEip712Hashed.to_u32().unwrap(), 0x21);
+        assert_eq!(EthAppOp::SignEip712Message.to_u32().unwrap(), 0x22);
+
+        // Metadata: 0x30-0x3F
+        assert_eq!(EthAppOp::ProvideErc20TokenInfo.to_u32().unwrap(), 0x30);
+        assert_eq!(EthAppOp::ByContractAddressAndChain.to_u32().unwrap(), 0x34);
+
+        // Key management: 0x50-0x5F
+        assert_eq!(EthAppOp::GetPublicKey.to_u32().unwrap(), 0x50);
+        assert_eq!(EthAppOp::GetAddress.to_u32().unwrap(), 0x51);
+
+        // Attestation: 0x80-0x8F
+        assert_eq!(EthAppOp::InitAttestation.to_u32().unwrap(), 0x80);
+        assert_eq!(EthAppOp::GetAttestationKey.to_u32().unwrap(), 0x81);
+        assert_eq!(EthAppOp::AttestSign.to_u32().unwrap(), 0x82);
+
+        // Ping: 0xFF
+        assert_eq!(EthAppOp::Ping.to_u32().unwrap(), 0xFF);
+    }
+
+    #[test]
+    fn test_opcode_roundtrip_all() {
+        let ops = [
+            EthAppOp::GetAppConfiguration, EthAppOp::GetChallenge, EthAppOp::Exit,
+            EthAppOp::SignTransaction, EthAppOp::ClearSignTransaction,
+            EthAppOp::SignPersonalMessage, EthAppOp::SignEip712Hashed,
+            EthAppOp::SignEip712Message,
+            EthAppOp::ProvideErc20TokenInfo, EthAppOp::ProvideNftInfo,
+            EthAppOp::ProvideDomainName, EthAppOp::LoadContractMethodInfo,
+            EthAppOp::ByContractAddressAndChain,
+            EthAppOp::Eth2GetPublicKey, EthAppOp::Eth2SetWithdrawalIndex,
+            EthAppOp::GetPublicKey, EthAppOp::GetAddress,
+            EthAppOp::SetSeed, EthAppOp::ImportMnemonic,
+            EthAppOp::GenerateMnemonic, EthAppOp::ClearSeed,
+            EthAppOp::EnableDangerousMainnet,
+            EthAppOp::InitImportKey, EthAppOp::GetImportKey, EthAppOp::ImportEncrypted,
+            EthAppOp::InitAttestation, EthAppOp::GetAttestationKey, EthAppOp::AttestSign,
+            EthAppOp::SerialFrame,
+            EthAppOp::ClearMetadataCache, EthAppOp::GetStats, EthAppOp::Ping,
+        ];
+        for op in &ops {
+            let val = op.to_u32().unwrap();
+            let back = EthAppOp::from_u32(val).unwrap();
+            assert_eq!(*op, back, "roundtrip failed for {op:?}");
+        }
+    }
+
+    #[test]
+    fn test_invalid_opcode_values() {
+        // Values that are not valid opcodes
+        assert!(EthAppOp::from_u32(0x00).is_none());
+        assert!(EthAppOp::from_u32(0x03).is_none());
+        assert!(EthAppOp::from_u32(0x12).is_none());
+        assert!(EthAppOp::from_u32(0x99).is_none());
     }
 }

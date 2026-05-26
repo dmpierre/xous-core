@@ -14,7 +14,6 @@ use rkyv::{Archive, Deserialize, Serialize};
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Archive, Serialize, Deserialize, FromPrimitive, ToPrimitive,
 )]
-#[archive(check_bytes)]
 #[repr(u32)]
 pub enum EthAppError {
     /// Operation completed successfully (not an error).
@@ -97,6 +96,21 @@ pub enum EthAppError {
 
     /// Cryptographic operation failed.
     CryptoError = 0x1A,
+
+    /// Attestation key already exists (use overwrite to replace).
+    AttestationKeyExists = 0x1B,
+
+    /// Attestation key not initialized.
+    AttestationNotInitialized = 0x1C,
+
+    /// Import key already exists (use overwrite to replace).
+    ImportKeyExists = 0x1D,
+
+    /// Import key not initialized.
+    ImportKeyNotInitialized = 0x1E,
+
+    /// Decryption or authentication tag verification failed.
+    DecryptionFailed = 0x1F,
 }
 
 impl EthAppError {
@@ -168,6 +182,11 @@ impl fmt::Display for EthAppError {
             EthAppError::StorageError => write!(f, "Storage error"),
             EthAppError::UiError => write!(f, "UI error"),
             EthAppError::CryptoError => write!(f, "Crypto error"),
+            EthAppError::AttestationKeyExists => write!(f, "Attestation key exists"),
+            EthAppError::AttestationNotInitialized => write!(f, "Attestation not initialized"),
+            EthAppError::ImportKeyExists => write!(f, "Import key exists"),
+            EthAppError::ImportKeyNotInitialized => write!(f, "Import key not initialized"),
+            EthAppError::DecryptionFailed => write!(f, "Decryption failed"),
         }
     }
 }
@@ -181,6 +200,11 @@ mod tests {
         assert_eq!(EthAppError::Success.code(), 0x00);
         assert_eq!(EthAppError::RejectedByUser.code(), 0x01);
         assert_eq!(EthAppError::CryptoError.code(), 0x1A);
+        assert_eq!(EthAppError::AttestationKeyExists.code(), 0x1B);
+        assert_eq!(EthAppError::AttestationNotInitialized.code(), 0x1C);
+        assert_eq!(EthAppError::ImportKeyExists.code(), 0x1D);
+        assert_eq!(EthAppError::ImportKeyNotInitialized.code(), 0x1E);
+        assert_eq!(EthAppError::DecryptionFailed.code(), 0x1F);
     }
 
     #[test]
@@ -189,5 +213,83 @@ mod tests {
         assert!(!EthAppError::RejectedByUser.is_success());
         assert!(EthAppError::RejectedByUser.is_user_rejection());
         assert!(EthAppError::InvalidSignature.is_security_error());
+    }
+
+    #[test]
+    fn test_all_security_errors() {
+        let security_errors = [
+            EthAppError::InvalidSignature,
+            EthAppError::SecurityViolation,
+            EthAppError::BlindSigningDisabled,
+            EthAppError::InvalidDerivationPath,
+        ];
+        for err in &security_errors {
+            assert!(err.is_security_error(), "{err} should be security error");
+        }
+    }
+
+    #[test]
+    fn test_non_security_errors() {
+        let non_security = [
+            EthAppError::Success,
+            EthAppError::RejectedByUser,
+            EthAppError::InvalidOpcode,
+            EthAppError::InternalError,
+            EthAppError::Timeout,
+            EthAppError::CryptoError,
+        ];
+        for err in &non_security {
+            assert!(!err.is_security_error(), "{err} should NOT be security error");
+        }
+    }
+
+    #[test]
+    fn test_error_codes_are_unique() {
+        use alloc::vec::Vec;
+        let errors = [
+            EthAppError::Success, EthAppError::RejectedByUser, EthAppError::InvalidOpcode,
+            EthAppError::InvalidParameter, EthAppError::InvalidData, EthAppError::InvalidSignature,
+            EthAppError::SecurityViolation, EthAppError::UnsupportedOperation,
+            EthAppError::InternalError, EthAppError::Timeout, EthAppError::BlindSigningDisabled,
+            EthAppError::MetadataNotFound, EthAppError::InvalidDerivationPath,
+            EthAppError::KeyDerivationFailed, EthAppError::SigningFailed,
+            EthAppError::InvalidTransaction, EthAppError::InvalidRlp, EthAppError::InvalidMessage,
+            EthAppError::InvalidTypedData, EthAppError::InvalidState, EthAppError::ChunkError,
+            EthAppError::BufferOverflow, EthAppError::ServiceConnectionFailed,
+            EthAppError::SerializationError, EthAppError::StorageError, EthAppError::UiError,
+            EthAppError::CryptoError, EthAppError::AttestationKeyExists,
+            EthAppError::AttestationNotInitialized, EthAppError::ImportKeyExists,
+            EthAppError::ImportKeyNotInitialized, EthAppError::DecryptionFailed,
+        ];
+        let mut codes: Vec<u32> = errors.iter().map(|e| e.code()).collect();
+        let len_before = codes.len();
+        codes.sort();
+        codes.dedup();
+        assert_eq!(codes.len(), len_before, "duplicate error codes found");
+    }
+
+    #[test]
+    fn test_error_display_non_empty() {
+        use core::fmt::Write;
+        let errors = [
+            EthAppError::Success, EthAppError::RejectedByUser, EthAppError::CryptoError,
+        ];
+        for err in &errors {
+            let mut buf = alloc::string::String::new();
+            write!(buf, "{err}").unwrap();
+            assert!(!buf.is_empty(), "display for {err:?} should not be empty");
+        }
+    }
+
+    #[test]
+    fn test_error_default_is_success() {
+        assert_eq!(EthAppError::default(), EthAppError::Success);
+    }
+
+    #[test]
+    fn test_error_code_contiguous() {
+        // Error codes should be 0x00 through 0x1F contiguously
+        assert_eq!(EthAppError::Success.code(), 0x00);
+        assert_eq!(EthAppError::DecryptionFailed.code(), 0x1F);
     }
 }
