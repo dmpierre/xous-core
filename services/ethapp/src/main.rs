@@ -137,6 +137,9 @@ fn handle_message(
         EthAppOp::SignEip712Message => {
             handlers::handle_sign_eip712_message(state, msg)?;
         }
+        EthAppOp::SignEip7702Auth => {
+            handlers::handle_sign_transaction(state, msg)?;
+        }
 
         // === Metadata Provision ===
         EthAppOp::ProvideErc20TokenInfo => {

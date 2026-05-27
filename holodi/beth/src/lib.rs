@@ -26,6 +26,7 @@ const OP_SIGN_TRANSACTION: u8 = 0x10;
 const OP_INIT_IMPORT_KEY: u8 = 0x65;
 const OP_GET_IMPORT_KEY: u8 = 0x66;
 const OP_IMPORT_ENCRYPTED: u8 = 0x67;
+const OP_SIGN_EIP7702_AUTH: u8 = 0x23;
 const OP_INIT_ATTESTATION: u8 = 0x80;
 const OP_GET_ATTESTATION_KEY: u8 = 0x81;
 const OP_ATTEST_SIGN: u8 = 0x82;
@@ -341,6 +342,107 @@ pub enum Commands {
         data: Option<String>,
     },
 
+    /// Sign an EIP-7702 authorization tuple on the device.
+    ///
+    /// The device signs keccak256(0x05 || rlp([chain_id, delegate, nonce]))
+    /// with the key at --index. The output (y_parity, r, s) can be fed
+    /// directly into `beth build-eip7702-tx --auth`.
+    SignEip7702Auth {
+        /// Chain ID of the authorization (use 0 to sign for any chain)
+        #[arg(long)]
+        chain_id: u64,
+
+        /// Contract address to delegate to (hex, 20 bytes)
+        #[arg(long)]
+        delegate: String,
+
+        /// Current nonce of the authorizing EOA
+        #[arg(long)]
+        nonce: u64,
+
+        /// Account index (m/44'/60'/0'/0/<index>)
+        #[arg(long, default_value = "0")]
+        index: u32,
+    },
+
+    /// Build an unsigned EIP-7702 type-4 transaction (offline, no device).
+    ///
+    /// Takes one or more pre-signed authorization tuples (from `sign-eip7702-auth`)
+    /// and produces unsigned RLP ready for `beth sign-tx`.
+    BuildEip7702Tx {
+        /// Recipient address (hex, 20 bytes)
+        destination: String,
+
+        /// Value in wei
+        value: u128,
+
+        /// Sender nonce
+        #[arg(long, default_value = "0")]
+        nonce: u64,
+
+        /// Chain ID
+        #[arg(long, default_value = "11155111")]
+        chain_id: u64,
+
+        /// EIP-1559 max priority fee per gas (wei)
+        #[arg(long, default_value = "1000000000")]
+        max_priority_fee: u128,
+
+        /// EIP-1559 max fee per gas (wei)
+        #[arg(long, default_value = "1000000000")]
+        max_fee: u128,
+
+        /// Gas limit
+        #[arg(long, default_value = "50000")]
+        gas_limit: u64,
+
+        /// Pre-signed authorization tuple: chain_id:address:nonce:y_parity:r_hex:s_hex
+        /// Repeat --auth for multiple delegating EOAs.
+        #[arg(long = "auth", required = true)]
+        authorizations: Vec<String>,
+    },
+
+    /// Build, sign, and optionally broadcast an EIP-7702 type-4 transaction.
+    ///
+    /// Fetches nonce and fee estimates from --rpc-url, signs on the device,
+    /// and optionally broadcasts via eth_sendRawTransaction.
+    GenEip7702Tx {
+        /// Recipient address (hex, 20 bytes)
+        destination: String,
+
+        /// Value in wei
+        value: u128,
+
+        /// JSON-RPC URL for chain state and broadcast
+        #[arg(long)]
+        rpc_url: String,
+
+        /// Pre-signed authorization tuple: chain_id:address:nonce:y_parity:r_hex:s_hex
+        /// Repeat --auth for multiple delegating EOAs.
+        #[arg(long = "auth", required = true)]
+        authorizations: Vec<String>,
+
+        /// Account index for signing
+        #[arg(long, default_value = "0")]
+        index: u32,
+
+        /// Broadcast the signed tx immediately
+        #[arg(long)]
+        broadcast: bool,
+
+        /// Override nonce (default: fetched from RPC)
+        #[arg(long)]
+        nonce: Option<u64>,
+
+        /// Override chain ID (default: fetched from RPC)
+        #[arg(long)]
+        chain_id: Option<u64>,
+
+        /// Override gas limit (default: 50000)
+        #[arg(long)]
+        gas_limit: Option<u64>,
+    },
+
     /// Build, sign, and emit a legacy (EIP-155) ETH transfer transaction.
     /// Output is the raw signed tx hex ready to broadcast via eth_sendRawTransaction.
     GenTx {
@@ -419,6 +521,15 @@ pub fn dispatch(command: Commands, port: Option<&str>) -> Result<()> {
                 to, *value, *nonce, *chain_id, *gas_price, *gas_limit, data.as_deref(),
             );
         }
+        Commands::BuildEip7702Tx {
+            destination, value, nonce, chain_id, max_priority_fee, max_fee,
+            gas_limit, authorizations,
+        } => {
+            return cmd_build_eip7702_tx(
+                destination, *value, *nonce, *chain_id,
+                *max_priority_fee, *max_fee, *gas_limit, authorizations,
+            );
+        }
         Commands::Publish { signed_tx_hex, rpc_url, wait, wait_timeout } => {
             return cmd_publish(signed_tx_hex, rpc_url, *wait, *wait_timeout);
         }
@@ -451,6 +562,16 @@ pub fn dispatch(command: Commands, port: Option<&str>) -> Result<()> {
         Commands::DangerousMode => cmd_dangerous_mode(&mut transport),
         Commands::SignMessage { message, index } => cmd_sign_message(&mut transport, &message, index),
         Commands::SignTx { rlp_hex, index } => cmd_sign_tx(&mut transport, &rlp_hex, index),
+        Commands::SignEip7702Auth { chain_id, delegate, nonce, index } => {
+            cmd_sign_eip7702_auth(&mut transport, chain_id, &delegate, nonce, index)
+        }
+        Commands::GenEip7702Tx {
+            destination, value, rpc_url, authorizations, index,
+            broadcast, nonce, chain_id, gas_limit,
+        } => cmd_gen_eip7702_tx(
+            &mut transport, &destination, value, &rpc_url, &authorizations,
+            index, broadcast, nonce, chain_id, gas_limit,
+        ),
         Commands::GenTx {
             to, value, nonce, chain_id, gas_price, gas_limit, index, data,
         } => cmd_gen_tx(
@@ -485,7 +606,8 @@ pub fn dispatch(command: Commands, port: Option<&str>) -> Result<()> {
         }
         Commands::Ui
         | Commands::Guide { .. }
-        | Commands::BuildTx { .. } | Commands::Publish { .. }
+        | Commands::BuildTx { .. } | Commands::BuildEip7702Tx { .. }
+        | Commands::Publish { .. }
         | Commands::Balance { address: Some(_), .. }
         | Commands::TokenBalance { address: Some(_), .. }
         | Commands::Qr { address: Some(_), .. }
@@ -611,8 +733,192 @@ fn cmd_sign_tx(t: &mut Transport, rlp_hex: &str, index: u32) -> Result<()> {
     Ok(())
 }
 
+// =============================================================================
+// EIP-7702 signing commands
+// =============================================================================
+
+/// Sign a single EIP-7702 authorization tuple on the device.
+///
+/// Output includes the `y_parity:r:s` values and a ready-to-paste
+/// `--auth` string for `beth build-eip7702-tx` or `beth gen-eip7702-tx`.
+fn cmd_sign_eip7702_auth(
+    t: &mut Transport,
+    chain_id: u64,
+    delegate: &str,
+    nonce: u64,
+    index: u32,
+) -> Result<()> {
+    let addr_hex = delegate.strip_prefix("0x").unwrap_or(delegate);
+    let addr_bytes = hex::decode(addr_hex)?;
+    if addr_bytes.len() != 20 {
+        bail!("delegate address must be 20 bytes, got {}", addr_bytes.len());
+    }
+    let mut address = [0u8; 20];
+    address.copy_from_slice(&addr_bytes);
+
+    // Wire payload: [path_bytes...][chain_id: 8 BE][address: 20][nonce: 8 BE]
+    let mut payload = bip44_payload(0, 0, index);
+    payload.extend_from_slice(&chain_id.to_be_bytes());
+    payload.extend_from_slice(&address);
+    payload.extend_from_slice(&nonce.to_be_bytes());
+
+    let (status, resp) = t.command(OP_SIGN_EIP7702_AUTH, &payload)?;
+    if status != STATUS_OK {
+        bail!("sign-eip7702-auth failed (status: 0x{:02x})", status);
+    }
+    if resp.len() < 72 {
+        bail!("unexpected response length: {}", resp.len());
+    }
+
+    let y_parity = u64::from_le_bytes(resp[0..8].try_into().unwrap());
+    if y_parity > 1 {
+        bail!("device returned invalid y_parity: {} (expected 0 or 1)", y_parity);
+    }
+    let mut r = [0u8; 32];
+    let mut s = [0u8; 32];
+    r.copy_from_slice(&resp[8..40]);
+    s.copy_from_slice(&resp[40..72]);
+
+    println!("y_parity={}", y_parity);
+    println!("r=0x{}", hex::encode(&r));
+    println!("s=0x{}", hex::encode(&s));
+    // Ready-to-paste --auth argument
+    println!(
+        "auth: {}:0x{}:{}:{}:0x{}:0x{}",
+        chain_id, addr_hex, nonce, y_parity,
+        hex::encode(&r), hex::encode(&s)
+    );
+    Ok(())
+}
+
+/// Build an unsigned EIP-7702 type-4 transaction (offline, no device).
+#[allow(clippy::too_many_arguments)]
+fn cmd_build_eip7702_tx(
+    destination: &str,
+    value: u128,
+    nonce: u64,
+    chain_id: u64,
+    max_priority_fee: u128,
+    max_fee: u128,
+    gas_limit: u64,
+    authorizations: &[String],
+) -> Result<()> {
+    let dest_hex = destination.strip_prefix("0x").unwrap_or(destination);
+    let dest_bytes = hex::decode(dest_hex)?;
+    if dest_bytes.len() != 20 {
+        bail!("destination must be 20 bytes, got {}", dest_bytes.len());
+    }
+
+    let auth_tuples: Result<Vec<Vec<u8>>> = authorizations.iter()
+        .map(|s| parse_signed_auth(s))
+        .collect();
+    let auth_tuples = auth_tuples?;
+
+    let unsigned = rlp_encode_eip7702_unsigned(
+        chain_id, nonce, max_priority_fee, max_fee,
+        gas_limit, &dest_bytes, value, &[], &[], &auth_tuples,
+    );
+
+    println!("chain:     {} ({})", chain_id, chain_name(chain_id));
+    println!("to:        0x{}", dest_hex);
+    println!("value:     {} wei", value);
+    println!("nonce:     {}  gas: {}  maxFee: {} wei  priorityFee: {} wei",
+        nonce, gas_limit, max_fee, max_priority_fee);
+    println!("auths:     {}", auth_tuples.len());
+    println!("unsigned:  0x{}", hex::encode(&unsigned));
+    println!();
+    println!("To sign and broadcast: beth sign-tx 0x{}", hex::encode(&unsigned));
+    Ok(())
+}
+
+/// Build, sign, and optionally broadcast an EIP-7702 type-4 transaction.
+#[allow(clippy::too_many_arguments)]
+fn cmd_gen_eip7702_tx(
+    t: &mut Transport,
+    destination: &str,
+    value: u128,
+    rpc_url: &str,
+    authorizations: &[String],
+    index: u32,
+    broadcast: bool,
+    nonce_override: Option<u64>,
+    chain_id_override: Option<u64>,
+    gas_limit_override: Option<u64>,
+) -> Result<()> {
+    let dest_hex = destination.strip_prefix("0x").unwrap_or(destination);
+    let dest_bytes = hex::decode(dest_hex)?;
+    if dest_bytes.len() != 20 {
+        bail!("destination must be 20 bytes, got {}", dest_bytes.len());
+    }
+
+    // Get sender address from device
+    let path = bip44_payload(0, 0, index);
+    let (status, addr_resp) = t.command(OP_GET_ADDRESS, &path)?;
+    if status != STATUS_OK || addr_resp.len() < 20 {
+        bail!("failed to get address from device (status: 0x{:02x})", status);
+    }
+    let sender_hex = format!("0x{}", hex::encode(&addr_resp[..20]));
+
+    // Fetch chain state
+    let mut rpc = rpc::RpcClient::new(rpc_url);
+    let chain_id = chain_id_override.map_or_else(|| rpc.chain_id(), Ok)?;
+    let nonce = nonce_override.map_or_else(|| rpc.nonce(&sender_hex), Ok)?;
+    let fees = rpc.fee_suggestion()?
+        .ok_or_else(|| anyhow::anyhow!("chain does not support EIP-1559"))?;
+    let max_priority_fee = fees.priority_fee_per_gas;
+    let max_fee = fees.max_fee_per_gas();
+    let gas_limit = gas_limit_override.unwrap_or(50_000);
+
+    let auth_tuples: Result<Vec<Vec<u8>>> = authorizations.iter()
+        .map(|s| parse_signed_auth(s))
+        .collect();
+    let auth_tuples = auth_tuples?;
+
+    let unsigned = rlp_encode_eip7702_unsigned(
+        chain_id, nonce, max_priority_fee, max_fee,
+        gas_limit, &dest_bytes, value, &[], &[], &auth_tuples,
+    );
+
+    // Sign via OP_SIGN_TRANSACTION — parser handles type-4 RLP
+    let mut sign_payload = bip44_payload(0, 0, index);
+    sign_payload.extend_from_slice(&unsigned);
+    let (status, resp) = t.command(OP_SIGN_TRANSACTION, &sign_payload)?;
+    if status != STATUS_OK {
+        bail!("sign failed (status: 0x{:02x})", status);
+    }
+    if resp.len() < 72 {
+        bail!("unexpected signature response length: {}", resp.len());
+    }
+
+    let v = u64::from_le_bytes(resp[0..8].try_into().unwrap());
+    let mut r = [0u8; 32];
+    let mut s = [0u8; 32];
+    r.copy_from_slice(&resp[8..40]);
+    s.copy_from_slice(&resp[40..72]);
+
+    let signed = assemble_signed_tx(&unsigned, Some(0x04), v, &r, &s)?;
+
+    println!("chain:     {} ({})", chain_id, chain_name(chain_id));
+    println!("to:        0x{}", dest_hex);
+    println!("value:     {} wei", value);
+    println!("nonce:     {}  gas: {}  maxFee: {} wei  priorityFee: {} wei",
+        nonce, gas_limit, max_fee, max_priority_fee);
+    println!("auths:     {}", auth_tuples.len());
+    println!("y_parity={}", v);
+    println!("r={}", hex::encode(&r));
+    println!("s={}", hex::encode(&s));
+    println!("raw: 0x{}", hex::encode(&signed));
+
+    if broadcast {
+        let tx_hash = rpc.send_raw_transaction(&signed)?;
+        println!("tx hash: {}", tx_hash);
+    }
+
+    Ok(())
+}
+
 /// Combine an unsigned tx with the signature returned by the device into a
-/// broadcastable signed RLP. Supports legacy EIP-155, EIP-2930, and EIP-1559.
+/// broadcastable signed RLP. Supports legacy EIP-155, EIP-2930, EIP-1559, and EIP-7702.
 fn assemble_signed_tx(
     tx_data: &[u8],
     tx_type: Option<u8>,
@@ -675,6 +981,29 @@ fn assemble_signed_tx(
             payload.extend_from_slice(&rlp_encode_bytes(trim_leading_zeros(r)));
             payload.extend_from_slice(&rlp_encode_bytes(trim_leading_zeros(s)));
             let mut out = vec![0x02];
+            out.extend_from_slice(&rlp_encode_list(&payload));
+            Ok(out)
+        }
+        // EIP-7702 (type 0x04): unsigned has 10 items
+        // [chainId, nonce, maxPriorityFeePerGas, maxFeePerGas, gasLimit, to,
+        //  value, data, accessList, authorizationList].
+        // Append [yParity, r, s] to form the signed body, then prepend type byte.
+        Some(0x04) => {
+            let items = decode_top_level_items(&tx_data[1..])?;
+            if items.len() != 10 {
+                bail!("expected 10 RLP items in EIP-7702 tx, got {}", items.len());
+            }
+            if v > 1 {
+                bail!("invalid y_parity for EIP-7702 tx: {} (must be 0 or 1)", v);
+            }
+            let mut payload = Vec::new();
+            for item in &items {
+                payload.extend_from_slice(item);
+            }
+            payload.extend_from_slice(&rlp_encode_u64(v));
+            payload.extend_from_slice(&rlp_encode_bytes(trim_leading_zeros(r)));
+            payload.extend_from_slice(&rlp_encode_bytes(trim_leading_zeros(s)));
+            let mut out = vec![0x04];
             out.extend_from_slice(&rlp_encode_list(&payload));
             Ok(out)
         }
@@ -1844,6 +2173,122 @@ fn encode_erc20_balance_of(owner: &[u8; 20]) -> Vec<u8> {
     data
 }
 
+/// RLP-encode a single EIP-7702 authorization tuple:
+/// `[chain_id, address, nonce, y_parity, r, s]`
+fn rlp_encode_auth_tuple(
+    chain_id: u64,
+    address: &[u8; 20],
+    nonce: u64,
+    y_parity: u8,
+    r: &[u8; 32],
+    s: &[u8; 32],
+) -> Vec<u8> {
+    let mut items = Vec::new();
+    items.extend_from_slice(&rlp_encode_u64(chain_id));
+    items.extend_from_slice(&rlp_encode_bytes(address));
+    items.extend_from_slice(&rlp_encode_u64(nonce));
+    items.extend_from_slice(&rlp_encode_u64(y_parity as u64));
+    items.extend_from_slice(&rlp_encode_bytes(trim_leading_zeros(r)));
+    items.extend_from_slice(&rlp_encode_bytes(trim_leading_zeros(s)));
+    rlp_encode_list(&items)
+}
+
+/// RLP-encode a list of pre-encoded authorization tuples into an
+/// `authorization_list` RLP list.
+fn rlp_encode_auth_list(encoded_tuples: &[Vec<u8>]) -> Vec<u8> {
+    let mut items = Vec::new();
+    for t in encoded_tuples {
+        items.extend_from_slice(t);
+    }
+    rlp_encode_list(&items)
+}
+
+/// RLP-encode an unsigned EIP-7702 type-4 transaction:
+/// `0x04 || rlp([chain_id, nonce, max_priority_fee, max_fee, gas_limit,
+///               to, value, data, access_list, authorization_list])`
+///
+/// `access_list` accepts pre-encoded EIP-2930 access list entries.
+/// Pass `&[]` for an empty access list (the common case).
+#[allow(clippy::too_many_arguments)]
+fn rlp_encode_eip7702_unsigned(
+    chain_id: u64,
+    nonce: u64,
+    max_priority_fee: u128,
+    max_fee: u128,
+    gas_limit: u64,
+    to: &[u8],
+    value: u128,
+    data: &[u8],
+    access_list: &[u8],
+    auth_tuples: &[Vec<u8>],
+) -> Vec<u8> {
+    let mut items = Vec::new();
+    items.extend_from_slice(&rlp_encode_u64(chain_id));
+    items.extend_from_slice(&rlp_encode_u64(nonce));
+    items.extend_from_slice(&rlp_encode_u128(max_priority_fee));
+    items.extend_from_slice(&rlp_encode_u128(max_fee));
+    items.extend_from_slice(&rlp_encode_u64(gas_limit));
+    items.extend_from_slice(&rlp_encode_bytes(to));
+    items.extend_from_slice(&rlp_encode_u128(value));
+    items.extend_from_slice(&rlp_encode_bytes(data));
+    items.extend_from_slice(&rlp_encode_list(access_list));
+    items.extend_from_slice(&rlp_encode_auth_list(auth_tuples));
+    let mut out = vec![0x04];
+    out.extend_from_slice(&rlp_encode_list(&items));
+    out
+}
+
+/// Parse a signed authorization tuple from the CLI string format:
+/// `chain_id:address_hex:nonce:y_parity:r_hex:s_hex`
+///
+/// Returns the RLP-encoded tuple ready for inclusion in an authorization list.
+fn parse_signed_auth(s: &str) -> Result<Vec<u8>> {
+    let parts: Vec<&str> = s.splitn(6, ':').collect();
+    if parts.len() != 6 {
+        bail!("--auth must have 6 elements, chain_id:address:nonce:y_parity:r:s, got: {} elements", parts.len());
+    }
+    let chain_id: u64 = parts[0].parse()
+        .map_err(|e| anyhow::anyhow!("invalid auth chain_id '{}': {}", parts[0], e))?;
+
+    let addr_hex = parts[1].strip_prefix("0x").unwrap_or(parts[1]);
+    let addr_bytes = hex::decode(addr_hex)
+        .map_err(|e| anyhow::anyhow!("invalid auth address '{}': {}", parts[1], e))?;
+    if addr_bytes.len() != 20 {
+        bail!("auth address must be 20 bytes, got {}", addr_bytes.len());
+    }
+    let mut address = [0u8; 20];
+    address.copy_from_slice(&addr_bytes);
+
+    let nonce: u64 = parts[2].parse()
+        .map_err(|e| anyhow::anyhow!("invalid auth nonce '{}': {}", parts[2], e))?;
+
+    let y_parity: u8 = parts[3].parse()
+        .map_err(|e| anyhow::anyhow!("invalid auth y_parity '{}': {}", parts[3], e))?;
+    if y_parity > 1 {
+        bail!("auth y_parity must be 0 or 1, got {}", y_parity);
+    }
+
+    let r_hex = parts[4].strip_prefix("0x").unwrap_or(parts[4]);
+    let r_bytes = hex::decode(r_hex)
+        .map_err(|e| anyhow::anyhow!("invalid auth r '{}': {}", parts[4], e))?;
+    if r_bytes.is_empty() || r_bytes.len() > 32 {
+        bail!("auth r must be 1–32 bytes, got {}", r_bytes.len());
+    }
+    let mut r = [0u8; 32];
+    r[32 - r_bytes.len()..].copy_from_slice(&r_bytes);
+
+    let s_hex = parts[5].strip_prefix("0x").unwrap_or(parts[5]);
+    let s_bytes = hex::decode(s_hex)
+        .map_err(|e| anyhow::anyhow!("invalid auth s '{}': {}", parts[5], e))?;
+    if s_bytes.is_empty() || s_bytes.len() > 32 {
+        bail!("auth s must be 1–32 bytes, got {}", s_bytes.len());
+    }
+    let mut s = [0u8; 32];
+    s[32 - s_bytes.len()..].copy_from_slice(&s_bytes);
+
+    Ok(rlp_encode_auth_tuple(chain_id, &address, nonce, y_parity, &r, &s))
+}
+
 /// RLP-encode an unsigned EIP-1559 transaction:
 /// 0x02 || rlp([chainId, nonce, maxPriorityFeePerGas, maxFeePerGas,
 ///              gasLimit, to, value, data, accessList(empty)])
@@ -1977,5 +2422,104 @@ fn chain_name(id: u64) -> &'static str {
         42161 => "arbitrum",
         11155111 => "sepolia",
         _ => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rlp_encode_auth_tuple_field_count() {
+        let r = [0x11u8; 32];
+        let s = [0x22u8; 32];
+        let encoded = rlp_encode_auth_tuple(1, &[0xab; 20], 5, 0, &r, &s);
+
+        let items = decode_top_level_items(&encoded).expect("should decode as list");
+        assert_eq!(items.len(), 6, "auth tuple must have exactly 6 fields");
+    }
+
+    #[test]
+    fn test_rlp_encode_auth_tuple_field_values() {
+        // Verify each field is in the correct position.
+        let chain_id: u64 = 11155111;
+        let address = [0xdeu8; 20];
+        let nonce: u64 = 42;
+        let y_parity: u8 = 1;
+        let r = [0x33u8; 32];
+        let s = [0x44u8; 32];
+
+        let encoded = rlp_encode_auth_tuple(chain_id, &address, nonce, y_parity, &r, &s);
+        let items = decode_top_level_items(&encoded).unwrap();
+
+        let (_, payload_len, _) = parse_rlp_header(&items[0]).unwrap();
+        let chain_id_bytes = &items[0][items[0].len() - payload_len..];
+        let decoded_chain_id = chain_id_bytes.iter().fold(0u64, |a, &b| (a << 8) | b as u64);
+        assert_eq!(decoded_chain_id, chain_id);
+
+        assert_eq!(items[1][0], 0x94, "address field must have 20-byte string prefix");
+
+        let (_, yp_len, _) = parse_rlp_header(&items[3]).unwrap();
+        let yp_val = if yp_len == 0 { 0u8 } else { items[3][items[3].len() - 1] };
+        assert_eq!(yp_val, y_parity);
+    }
+
+    #[test]
+    fn test_rlp_encode_decode_eip7702() {
+        // EIP-7702 type-4 transactions must start with 0x04.
+        let r = [0x11u8; 32];
+        let s = [0x22u8; 32];
+        let auth = rlp_encode_auth_tuple(1, &[0xab; 20], 0, 0, &r, &s);
+        let tx = rlp_encode_eip7702_unsigned(
+            1, 0, 1_000_000_000, 1_000_000_000, 50_000,
+            &[0xde; 20], 0, &[], &[], &[auth],
+        );
+        assert_eq!(tx[0], 0x04, "type-4 tx must start with 0x04");
+
+        let items = decode_top_level_items(&tx[1..]).expect("should decode");
+        assert_eq!(items.len(), 10, "unsigned EIP-7702 tx must have 10 fields");
+
+        let (_, _, is_list) = parse_rlp_header(&items[9]).unwrap();
+        assert!(is_list, "field 9 must be the authorization_list (an RLP list)");
+
+        // That list must contain exactly one entry.
+        let auth_list_items = decode_top_level_items(&items[9]).unwrap();
+        assert_eq!(auth_list_items.len(), 1, "authorization_list must contain 1 entry");
+    }
+
+
+    // =========================================================================
+    // assemble_signed_tx — type-4 arm
+    // =========================================================================
+
+    #[test]
+    fn test_assemble_signed_tx_type4_produces_13_fields() {
+        // Signing a type-4 tx appends (y_parity, r, s) → 13 total fields.
+        let r_sig = [0x55u8; 32];
+        let s_sig = [0x66u8; 32];
+        let auth = rlp_encode_auth_tuple(1, &[0xab; 20], 0, 0, &[0x11; 32], &[0x22; 32]);
+        let unsigned = rlp_encode_eip7702_unsigned(
+            1, 0, 0, 0, 50_000,
+            &[0xde; 20], 0, &[], &[], &[auth],
+        );
+
+        let signed = assemble_signed_tx(&unsigned, Some(0x04), 0, &r_sig, &s_sig)
+            .expect("assemble should succeed");
+
+        assert_eq!(signed[0], 0x04, "signed tx must start with 0x04");
+        let items = decode_top_level_items(&signed[1..]).unwrap();
+        assert_eq!(items.len(), 13, "signed EIP-7702 tx must have 13 fields");
+    }
+
+    #[test]
+    fn test_assemble_signed_tx_type4_rejects_invalid_y_parity() {
+        let auth = rlp_encode_auth_tuple(1, &[0xab; 20], 0, 0, &[0x11; 32], &[0x22; 32]);
+        let unsigned = rlp_encode_eip7702_unsigned(
+            1, 0, 0, 0, 50_000,
+            &[0xde; 20], 0, &[], &[], &[auth],
+        );
+        // v = 2 is invalid for EIP-7702
+        let result = assemble_signed_tx(&unsigned, Some(0x04), 2, &[0x55; 32], &[0x66; 32]);
+        assert!(result.is_err(), "y_parity=2 must be rejected");
     }
 }

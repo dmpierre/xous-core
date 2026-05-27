@@ -231,6 +231,8 @@ pub enum TransactionType {
     AccessList = 0x01,
     /// EIP-1559 fee market transaction.
     FeeMarket = 0x02,
+    /// EIP-7702 set-code transaction.
+    SetCode = 0x04,
 }
 
 impl TryFrom<u8> for TransactionType {
@@ -241,6 +243,7 @@ impl TryFrom<u8> for TransactionType {
             0x00 => Ok(TransactionType::Legacy),
             0x01 => Ok(TransactionType::AccessList),
             0x02 => Ok(TransactionType::FeeMarket),
+            0x04 => Ok(TransactionType::SetCode),
             _ => Err(()),
         }
     }
@@ -349,6 +352,32 @@ pub struct SignEip712MessageRequest {
     pub path: Bip32Path,
     /// Binary-encoded typed data (not JSON).
     pub typed_data: Vec<u8>,
+}
+
+/// EIP-7702 authorization tuple (unsigned).
+///
+/// Each tuple expresses an EOA's intent to set its code to that of
+/// `address` for the duration of the containing type-4 transaction's
+/// execution. `chain_id == 0` means "valid on any chain".
+#[derive(Debug, Clone, Default, Archive, Serialize, Deserialize)]
+pub struct Eip7702Authorization {
+    pub chain_id: u64,
+    pub address: EthAddress,
+    pub nonce: u64,
+}
+
+/// EIP-7702 signed authorization tuple.
+///
+/// The authority is recovered from `(y_parity, r, s)` over
+/// `keccak256(MAGIC || rlp([chain_id, address, nonce]))`, where
+/// `MAGIC = 0x05`. `y_parity` MUST be 0 or 1.
+#[derive(Debug, Clone, Default, Archive, Serialize, Deserialize)]
+pub struct Eip7702SignedAuthorization {
+    pub inner: Eip7702Authorization,
+    /// Recovery bit — only 0 or 1 are valid.
+    pub y_parity: u8,
+    pub r: [u8; 32],
+    pub s: [u8; 32],
 }
 
 /// Request to provide token info.
@@ -784,8 +813,12 @@ mod tests {
 
     #[test]
     fn test_transaction_type_all_invalid() {
-        for byte in 3..=255u8 {
-            assert!(TransactionType::try_from(byte).is_err());
+        for byte in 0..=255u8 {
+            if matches!(byte, 0x00 | 0x01 | 0x02 | 0x04) {
+                assert!(TransactionType::try_from(byte).is_ok());
+            } else {
+                assert!(TransactionType::try_from(byte).is_err(), "byte 0x{:02x} should be invalid", byte);
+            }
         }
     }
 

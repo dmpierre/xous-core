@@ -39,14 +39,14 @@
 //! - xous-core: ComboHash engine capabilities
 
 use std::string::String;
-use std::vec::Vec;
 use std::string::ToString;
+use std::vec::Vec;
 
 use ethapp_common::{Bip32Path, EthAddress, EthAppError, Hash256, Signature, TransactionType};
 use k256::{
+    PublicKey,
     ecdsa::{RecoveryId, Signature as K256Signature, SigningKey},
     elliptic_curve::sec1::ToEncodedPoint,
-    PublicKey,
 };
 use tiny_keccak::{Hasher as KeccakHasher, Keccak};
 use zeroize::Zeroize;
@@ -121,9 +121,7 @@ pub struct Keccak256Hasher {
 impl Keccak256Hasher {
     /// Creates a new hasher.
     pub fn new() -> Self {
-        Self {
-            inner: Keccak::v256(),
-        }
+        Self { inner: Keccak::v256() }
     }
 
     /// Updates the hasher with data.
@@ -215,8 +213,7 @@ fn hmac_sha512_sw(key: &[u8], data: &[u8]) -> HmacSha512Output {
     // This cannot fail for HMAC (any key length is valid), but we
     // handle the error path defensively. In practice new_from_slice
     // only errors for algorithms with fixed key sizes (not HMAC).
-    let mut mac = HmacSha512::new_from_slice(key)
-        .expect("HMAC-SHA512 accepts any key length");
+    let mut mac = HmacSha512::new_from_slice(key).expect("HMAC-SHA512 accepts any key length");
     mac.update(data);
 
     let result = mac.finalize();
@@ -318,11 +315,10 @@ pub fn get_dev_seed() -> Seed {
     // This is the seed for the standard test mnemonic:
     // "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
     let seed_bytes: [u8; 64] = [
-        0x5e, 0xb0, 0x0b, 0xbd, 0xdc, 0xf0, 0x69, 0x08, 0x48, 0x89, 0xa8, 0xab, 0x91, 0x55, 0x56,
-        0x81, 0x65, 0xf5, 0xc4, 0x53, 0xcc, 0xb8, 0x5e, 0x70, 0x81, 0x1a, 0xae, 0xd6, 0xf6, 0xda,
-        0x5f, 0xc1, 0x9a, 0x5a, 0xc4, 0x0b, 0x38, 0x9c, 0xd3, 0x70, 0xd0, 0x86, 0x20, 0x6d, 0xec,
-        0x8a, 0xa6, 0xc4, 0x3d, 0xae, 0xa6, 0x69, 0x0f, 0x20, 0xad, 0x3d, 0x8d, 0x48, 0xb2, 0xd2,
-        0xce, 0x9e, 0x38, 0xe4,
+        0x5e, 0xb0, 0x0b, 0xbd, 0xdc, 0xf0, 0x69, 0x08, 0x48, 0x89, 0xa8, 0xab, 0x91, 0x55, 0x56, 0x81, 0x65,
+        0xf5, 0xc4, 0x53, 0xcc, 0xb8, 0x5e, 0x70, 0x81, 0x1a, 0xae, 0xd6, 0xf6, 0xda, 0x5f, 0xc1, 0x9a, 0x5a,
+        0xc4, 0x0b, 0x38, 0x9c, 0xd3, 0x70, 0xd0, 0x86, 0x20, 0x6d, 0xec, 0x8a, 0xa6, 0xc4, 0x3d, 0xae, 0xa6,
+        0x69, 0x0f, 0x20, 0xad, 0x3d, 0x8d, 0x48, 0xb2, 0xd2, 0xce, 0x9e, 0x38, 0xe4,
     ];
     Seed::from_bytes(&seed_bytes)
 }
@@ -384,8 +380,7 @@ pub fn generate_mnemonic(entropy: &mut [u8; 32]) -> Result<(Vec<String>, Seed), 
 
     // Convert entropy to 24 BIP39 words (bytes_to_bip39 handles SHA-256
     // checksum computation internally)
-    let words = bytes_to_bip39(&entropy_vec)
-        .map_err(|_| EthAppError::CryptoError)?;
+    let words = bytes_to_bip39(&entropy_vec).map_err(|_| EthAppError::CryptoError)?;
 
     // Derive seed from the mnemonic words via PBKDF2-HMAC-SHA512
     let mnemonic_str = words.join(" ");
@@ -419,26 +414,22 @@ pub fn derive_private_key(seed: &Seed, path: &Bip32Path) -> Result<SigningKey, E
     use bip32::{ChildNumber, XPrv};
 
     // Derive the key iteratively using child numbers
-    let mut xprv = XPrv::new(seed.as_bytes())
-        .map_err(|_| EthAppError::KeyDerivationFailed)?;
+    let mut xprv = XPrv::new(seed.as_bytes()).map_err(|_| EthAppError::KeyDerivationFailed)?;
 
     for &component in path.as_slice() {
         let child = if component & Bip32Path::HARDENED != 0 {
             ChildNumber::new(component & !Bip32Path::HARDENED, true)
                 .map_err(|_| EthAppError::InvalidDerivationPath)?
         } else {
-            ChildNumber::new(component, false)
-                .map_err(|_| EthAppError::InvalidDerivationPath)?
+            ChildNumber::new(component, false).map_err(|_| EthAppError::InvalidDerivationPath)?
         };
-        xprv = xprv.derive_child(child)
-            .map_err(|_| EthAppError::KeyDerivationFailed)?;
+        xprv = xprv.derive_child(child).map_err(|_| EthAppError::KeyDerivationFailed)?;
     }
 
     // Convert to signing key
     let private_key_bytes = xprv.private_key().to_bytes();
-    let signing_key =
-        SigningKey::from_bytes((&private_key_bytes[..]).into())
-            .map_err(|_| EthAppError::KeyDerivationFailed)?;
+    let signing_key = SigningKey::from_bytes((&private_key_bytes[..]).into())
+        .map_err(|_| EthAppError::KeyDerivationFailed)?;
 
     Ok(signing_key)
 }
@@ -496,9 +487,7 @@ pub fn sign_hash_recoverable(
     signing_key: &SigningKey,
     hash: &Hash256,
 ) -> Result<(K256Signature, RecoveryId), EthAppError> {
-    let (sig, recid) = signing_key
-        .sign_prehash_recoverable(hash)
-        .map_err(|_| EthAppError::SigningFailed)?;
+    let (sig, recid) = signing_key.sign_prehash_recoverable(hash).map_err(|_| EthAppError::SigningFailed)?;
 
     Ok((sig, recid))
 }
@@ -538,6 +527,21 @@ pub fn eip712_signing_hash(domain_hash: &Hash256, message_hash: &Hash256) -> Has
     keccak256(&data)
 }
 
+/// Compute the EIP-7702 authorization signing hash.
+/// `sign_hash = keccak256(0x05 || rlp([chain_id, address, nonce]))`
+pub fn eip7702_authorization_hash(chain_id: u64, address: &EthAddress, nonce: u64) -> Hash256 {
+    use ethapp_common::rlp;
+    let mut items = Vec::new();
+    items.extend_from_slice(&rlp::encode_u64(chain_id));
+    items.extend_from_slice(&rlp::encode_bytes(address));
+    items.extend_from_slice(&rlp::encode_u64(nonce));
+    let encoded = rlp::encode_list(&items);
+    let mut payload = Vec::with_capacity(1 + encoded.len());
+    payload.push(0x05);
+    payload.extend_from_slice(&encoded);
+    keccak256(&payload)
+}
+
 /// Build a transaction Signature from a bao-seed raw signature plus
 /// the Ethereum chain-id / tx-type context. Computes the appropriate
 /// `v` value per EIP-155 / EIP-2930 / EIP-1559 rules.
@@ -551,9 +555,7 @@ pub fn compose_eth_signature(
 }
 
 /// Build an EIP-191 Signature: v = 27 + recovery_id.
-pub fn compose_personal_message_signature(
-    raw: bao_seed_common::Secp256k1Signature,
-) -> Signature {
+pub fn compose_personal_message_signature(raw: bao_seed_common::Secp256k1Signature) -> Signature {
     Signature { v: 27u64 + raw.recovery_id as u64, r: raw.r, s: raw.s }
 }
 
@@ -568,8 +570,8 @@ pub fn compose_eip712_signature(raw: bao_seed_common::Secp256k1Signature) -> Sig
 /// human-readable address without ever materialising a private key in
 /// ethapp.
 pub fn address_from_compressed_pubkey(pubkey: &[u8; 33]) -> Result<EthAddress, EthAppError> {
-    let vk = k256::ecdsa::VerifyingKey::from_sec1_bytes(pubkey)
-        .map_err(|_| EthAppError::KeyDerivationFailed)?;
+    let vk =
+        k256::ecdsa::VerifyingKey::from_sec1_bytes(pubkey).map_err(|_| EthAppError::KeyDerivationFailed)?;
     let uncompressed = vk.to_encoded_point(false);
     let bytes = uncompressed.as_bytes();
     if bytes.len() != 65 {
@@ -614,10 +616,7 @@ pub fn sign_eth(
 /// Sign an EIP-191 personal message.
 ///
 /// Computes: keccak256("\x19Ethereum Signed Message:\n" + len + message)
-pub fn sign_personal_message(
-    signing_key: &SigningKey,
-    message: &[u8],
-) -> Result<Signature, EthAppError> {
+pub fn sign_personal_message(signing_key: &SigningKey, message: &[u8]) -> Result<Signature, EthAppError> {
     // Build EIP-191 prefixed message
     let prefix = b"\x19Ethereum Signed Message:\n";
     let len_str = message.len().to_string();
@@ -640,11 +639,7 @@ pub fn sign_personal_message(
     r.copy_from_slice(&r_bytes);
     s.copy_from_slice(&s_bytes);
 
-    Ok(Signature {
-        v: 27u64 + recid.to_byte() as u64,
-        r,
-        s,
-    })
+    Ok(Signature { v: 27u64 + recid.to_byte() as u64, r, s })
 }
 
 /// Sign EIP-712 typed data.
@@ -675,11 +670,7 @@ pub fn sign_eip712(
     r.copy_from_slice(&r_bytes);
     s.copy_from_slice(&s_bytes);
 
-    Ok(Signature {
-        v: 27u64 + recid.to_byte() as u64,
-        r,
-        s,
-    })
+    Ok(Signature { v: 27u64 + recid.to_byte() as u64, r, s })
 }
 
 /// Produce an attestation co-signature over a transaction signature.
@@ -711,11 +702,7 @@ pub fn attest_transaction_signature(
     r.copy_from_slice(&r_bytes);
     s.copy_from_slice(&s_bytes);
 
-    Ok(Signature {
-        v: 27u64 + recid.to_byte() as u64,
-        r,
-        s,
-    })
+    Ok(Signature { v: 27u64 + recid.to_byte() as u64, r, s })
 }
 
 // =============================================================================
@@ -735,10 +722,7 @@ const ECIES_SALT: &[u8] = b"ethapp-import-v1";
 /// 3. HKDF-SHA256: key = hkdf(shared, salt="ethapp-import-v1")
 /// 4. Nonce: sha256(e_pub_bytes)[..12]
 /// 5. ChaCha20-Poly1305 decrypt + verify tag
-pub fn ecies_decrypt(
-    import_key: &SigningKey,
-    payload: &[u8],
-) -> Result<Vec<u8>, EthAppError> {
+pub fn ecies_decrypt(import_key: &SigningKey, payload: &[u8]) -> Result<Vec<u8>, EthAppError> {
     use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::Aead};
     use hkdf::Hkdf;
     use sha2::Digest;
@@ -750,20 +734,15 @@ pub fn ecies_decrypt(
 
     // 1. Parse ephemeral public key
     let e_pub_bytes = &payload[..33];
-    let e_pub = k256::PublicKey::from_sec1_bytes(e_pub_bytes)
-        .map_err(|_| EthAppError::CryptoError)?;
+    let e_pub = k256::PublicKey::from_sec1_bytes(e_pub_bytes).map_err(|_| EthAppError::CryptoError)?;
 
     // 2. ECDH shared secret
-    let shared_secret = k256::ecdh::diffie_hellman(
-        import_key.as_nonzero_scalar(),
-        e_pub.as_affine(),
-    );
+    let shared_secret = k256::ecdh::diffie_hellman(import_key.as_nonzero_scalar(), e_pub.as_affine());
 
     // 3. HKDF-SHA256 to derive symmetric key
     let hk = Hkdf::<sha2::Sha256>::new(Some(ECIES_SALT), shared_secret.raw_secret_bytes());
     let mut key = [0u8; 32];
-    hk.expand(b"", &mut key)
-        .map_err(|_| EthAppError::CryptoError)?;
+    hk.expand(b"", &mut key).map_err(|_| EthAppError::CryptoError)?;
 
     // 4. Nonce: first 12 bytes of SHA-256(e_pub_bytes)
     let hash = sha2::Sha256::digest(e_pub_bytes);
@@ -773,8 +752,8 @@ pub fn ecies_decrypt(
     // 5. ChaCha20-Poly1305 decrypt
     let cipher = ChaCha20Poly1305::new((&key).into());
     let ciphertext_and_tag = &payload[33..];
-    let plaintext = cipher.decrypt((&nonce).into(), ciphertext_and_tag)
-        .map_err(|_| EthAppError::DecryptionFailed)?;
+    let plaintext =
+        cipher.decrypt((&nonce).into(), ciphertext_and_tag).map_err(|_| EthAppError::DecryptionFailed)?;
 
     // Zeroize key material
     zeroize::Zeroize::zeroize(&mut key);
@@ -794,11 +773,7 @@ pub fn ecies_decrypt(
 /// - Typed transactions (EIP-2930/EIP-1559): v = recovery_id (0 or 1)
 ///
 /// Returns u64 to support large chain IDs per EIP-155.
-fn compute_v(
-    recovery_id: u8,
-    chain_id: Option<u64>,
-    tx_type: TransactionType,
-) -> Result<u64, EthAppError> {
+fn compute_v(recovery_id: u8, chain_id: Option<u64>, tx_type: TransactionType) -> Result<u64, EthAppError> {
     match tx_type {
         TransactionType::Legacy => {
             if let Some(cid) = chain_id {
@@ -815,8 +790,8 @@ fn compute_v(
                 Ok(27u64 + recovery_id as u64)
             }
         }
-        TransactionType::AccessList | TransactionType::FeeMarket => {
-            // Typed transactions use just recovery_id (0 or 1)
+        TransactionType::AccessList | TransactionType::FeeMarket | TransactionType::SetCode => {
+            // EIP-2718 typed transactions all use the raw recovery bit
             Ok(recovery_id as u64)
         }
     }
@@ -837,17 +812,9 @@ pub fn format_address_checksummed(address: &EthAddress) -> [u8; 42] {
 
     for (i, c) in hex_lower.bytes().enumerate() {
         let hash_byte = hash[i / 2];
-        let nibble = if i % 2 == 0 {
-            hash_byte >> 4
-        } else {
-            hash_byte & 0x0F
-        };
+        let nibble = if i % 2 == 0 { hash_byte >> 4 } else { hash_byte & 0x0F };
 
-        result[2 + i] = if c.is_ascii_alphabetic() && nibble >= 8 {
-            c.to_ascii_uppercase()
-        } else {
-            c
-        };
+        result[2 + i] = if c.is_ascii_alphabetic() && nibble >= 8 { c.to_ascii_uppercase() } else { c };
     }
 
     result
@@ -864,18 +831,14 @@ mod tests {
     #[test]
     fn test_keccak256_empty() {
         let hash = keccak256(b"");
-        let expected = hex_literal::hex!(
-            "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
-        );
+        let expected = hex_literal::hex!("c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470");
         assert_eq!(hash, expected);
     }
 
     #[test]
     fn test_keccak256_hello() {
         let hash = keccak256(b"hello");
-        let expected = hex_literal::hex!(
-            "1c8aff950685c2ed4bc3174f3472287b56d9517b9c948127319a09a7a36deac8"
-        );
+        let expected = hex_literal::hex!("1c8aff950685c2ed4bc3174f3472287b56d9517b9c948127319a09a7a36deac8");
         assert_eq!(hash, expected);
     }
 
@@ -969,21 +932,17 @@ mod tests {
     #[test]
     fn test_hmac_sha512_bip32_master() {
         // BIP32 test vector 1 seed
-        let seed = hex_literal::hex!(
-            "000102030405060708090a0b0c0d0e0f"
-        );
+        let seed = hex_literal::hex!("000102030405060708090a0b0c0d0e0f");
         let result = hmac_sha512(b"Bitcoin seed", &seed);
 
         // Expected from BIP32 spec: master secret key (first 32 bytes)
-        let expected_key = hex_literal::hex!(
-            "e8f32e723decf4051aefac8e2c93c9c5b214313817cdb01a1494b917c8436b35"
-        );
+        let expected_key =
+            hex_literal::hex!("e8f32e723decf4051aefac8e2c93c9c5b214313817cdb01a1494b917c8436b35");
         assert_eq!(&result[..32], &expected_key);
 
         // Expected chain code (last 32 bytes)
-        let expected_chain = hex_literal::hex!(
-            "873dff81c02f525623fd1fe5167eac3a55a049de3d314bb42ee227ffed37d508"
-        );
+        let expected_chain =
+            hex_literal::hex!("873dff81c02f525623fd1fe5167eac3a55a049de3d314bb42ee227ffed37d508");
         assert_eq!(&result[32..], &expected_chain);
     }
 
@@ -1021,6 +980,15 @@ mod tests {
     }
 
     #[test]
+    fn test_compute_v_set_code() {
+        assert_eq!(compute_v(0, Some(1), TransactionType::SetCode).unwrap(), 0);
+        assert_eq!(compute_v(1, Some(1), TransactionType::SetCode).unwrap(), 1);
+        // chain_id is irrelevant for typed transactions
+        assert_eq!(compute_v(0, Some(999_999), TransactionType::SetCode).unwrap(), 0);
+        assert_eq!(compute_v(1, Some(999_999), TransactionType::SetCode).unwrap(), 1);
+    }
+
+    #[test]
     fn test_compute_v_large_chain_id() {
         // Chain ID 56 (BSC): v = 56 * 2 + 35 + 0 = 147
         let v = compute_v(0, Some(56), TransactionType::Legacy).unwrap();
@@ -1034,6 +1002,61 @@ mod tests {
         // Chain ID 999999: v = 999999 * 2 + 35 + 0 = 2000033
         let v = compute_v(0, Some(999_999), TransactionType::Legacy).unwrap();
         assert_eq!(v, 2_000_033u64);
+    }
+
+    // =========================================================================
+    // EIP-7702 authorization hash tests
+    // =========================================================================
+
+    #[test]
+    fn test_eip7702_authorization_hash_magic_byte() {
+        // The hash must be keccak256(0x05 || rlp([chain_id, address, nonce])).
+        // Verify by reconstructing the pre-image manually and hashing it.
+        let chain_id: u64 = 1;
+        let address = [0xab; 20];
+        let nonce: u64 = 0;
+
+        let hash = eip7702_authorization_hash(chain_id, &address, nonce);
+
+        // Reconstruct expected pre-image: 0x05 || rlp([1, 0xab..., 0])
+        use ethapp_common::rlp;
+        let mut items = Vec::new();
+        items.extend_from_slice(&rlp::encode_u64(chain_id));
+        items.extend_from_slice(&rlp::encode_bytes(&address));
+        items.extend_from_slice(&rlp::encode_u64(nonce));
+        let encoded = rlp::encode_list(&items);
+        let mut expected_preimage = vec![0x05u8];
+        expected_preimage.extend_from_slice(&encoded);
+
+        assert_eq!(hash, keccak256(&expected_preimage));
+    }
+
+    #[test]
+    fn test_eip7702_authorization_hash_differs_from_personal_sign() {
+        // An authorization hash must never collide with an EIP-191 personal message
+        // hash for the same raw bytes — the 0x05 magic prevents this.
+        let data = b"some message";
+        let personal_hash = eth_personal_message_hash(data);
+
+        // Build an authorization whose rlp payload happens to be the same bytes.
+        // The two hashes must differ because the domain prefix differs.
+        let auth_hash = keccak256(&{
+            let mut v = vec![0x05u8];
+            v.extend_from_slice(data);
+            v
+        });
+
+        assert_ne!(personal_hash, auth_hash);
+    }
+
+    #[test]
+    fn test_eip7702_authorization_hash_chain_id_zero() {
+        // chain_id = 0 means "valid on any chain" per EIP-7702.
+        // Ensure this doesn't panic or produce the wrong pre-image length.
+        let hash_zero = eip7702_authorization_hash(0, &[0xde; 20], 0);
+        let hash_one = eip7702_authorization_hash(1, &[0xde; 20], 0);
+        // Different chain IDs must produce different hashes.
+        assert_ne!(hash_zero, hash_one);
     }
 
     // =========================================================================

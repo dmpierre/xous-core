@@ -54,6 +54,11 @@ pub enum EthAppOp {
     /// Returns: Signature via memory message.
     SignEip712Message = 0x22,
 
+    /// Sign a full EIP-7702 (type-4) "set code" transaction.
+    /// Input: SignTransactionRequest (raw type-4 RLP) via memory message.
+    /// Returns: Signature via memory message.
+    SignEip7702Auth = 0x23,
+
     // === Metadata Provision (0x30-0x3F) ===
 
     /// Provide verified ERC-20 token metadata.
@@ -261,6 +266,7 @@ mod tests {
         assert_eq!(EthAppOp::SignPersonalMessage.to_u32().unwrap(), 0x20);
         assert_eq!(EthAppOp::SignEip712Hashed.to_u32().unwrap(), 0x21);
         assert_eq!(EthAppOp::SignEip712Message.to_u32().unwrap(), 0x22);
+        assert_eq!(EthAppOp::SignEip7702Auth.to_u32().unwrap(), 0x23);
 
         // Metadata: 0x30-0x3F
         assert_eq!(EthAppOp::ProvideErc20TokenInfo.to_u32().unwrap(), 0x30);
@@ -285,7 +291,7 @@ mod tests {
             EthAppOp::GetAppConfiguration, EthAppOp::GetChallenge, EthAppOp::Exit,
             EthAppOp::SignTransaction, EthAppOp::ClearSignTransaction,
             EthAppOp::SignPersonalMessage, EthAppOp::SignEip712Hashed,
-            EthAppOp::SignEip712Message,
+            EthAppOp::SignEip712Message, EthAppOp::SignEip7702Auth,
             EthAppOp::ProvideErc20TokenInfo, EthAppOp::ProvideNftInfo,
             EthAppOp::ProvideDomainName, EthAppOp::LoadContractMethodInfo,
             EthAppOp::ByContractAddressAndChain,

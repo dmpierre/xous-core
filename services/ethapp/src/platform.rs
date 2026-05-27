@@ -197,7 +197,7 @@ impl Platform for XousPlatform {
     fn show_transaction_review(
         &self,
         fields: &[(&str, &str)],
-        _action: &str,
+        action: &str,
     ) -> Result<bool, EthAppError> {
         // TODO(baochip): Use GAM ReviewScreen for secure transaction display.
 

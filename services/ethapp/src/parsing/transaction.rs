@@ -4,6 +4,7 @@
 //! - Legacy transactions (pre-EIP-2718)
 //! - EIP-2930 access list transactions (type 0x01)
 //! - EIP-1559 fee market transactions (type 0x02)
+//! - EIP-7702 set-code transactions (type 0x04)
 //!
 //! # Security
 //!
@@ -15,7 +16,10 @@
 
 use std::vec::Vec;
 
-use ethapp_common::{EthAddress, Hash256, TransactionType, MAX_TX_SIZE};
+use ethapp_common::{
+    Eip7702Authorization, Eip7702SignedAuthorization, EthAddress, Hash256, TransactionType,
+    MAX_TX_SIZE,
+};
 
 use ethapp_common::rlp::{self, RlpError, RlpItem};
 use crate::crypto::keccak256;
@@ -39,6 +43,8 @@ pub enum TxParseError {
     ValueOutOfRange,
     /// Invalid chain ID.
     InvalidChainId,
+    /// EIP-7702: authorization list must contain at least one entry.
+    EmptyAuthorizationList,
 }
 
 impl From<RlpError> for TxParseError {
@@ -68,8 +74,10 @@ pub struct ParsedTransaction {
     pub max_priority_fee: Option<[u8; 32]>,
     /// Input data.
     pub data: Vec<u8>,
-    /// Access list (EIP-2930/1559).
+    /// Access list (EIP-2930/1559/7702).
     pub access_list: Vec<(EthAddress, Vec<Hash256>)>,
+    /// EIP-7702 authorization list. Empty for all non-type-4 transactions.
+    pub authorization_list: Vec<Eip7702SignedAuthorization>,
     /// Hash to sign (keccak256 of RLP-encoded unsigned tx).
     pub sign_hash: Hash256,
     /// Original raw transaction data.
@@ -118,6 +126,7 @@ impl TransactionParser {
             match first_byte {
                 0x01 => Self::parse_eip2930(data),
                 0x02 => Self::parse_eip1559(data),
+                0x04 => Self::parse_eip7702(data),
                 _ => Err(TxParseError::UnknownType),
             }
         } else {
@@ -191,6 +200,7 @@ impl TransactionParser {
             max_priority_fee: None,
             data: input_data,
             access_list: Vec::new(),
+            authorization_list: Vec::new(),
             sign_hash,
             raw_data: data.to_vec(),
         })
@@ -236,6 +246,7 @@ impl TransactionParser {
             max_priority_fee: None,
             data: input_data,
             access_list,
+            authorization_list: Vec::new(),
             sign_hash,
             raw_data: data.to_vec(),
         })
@@ -282,6 +293,72 @@ impl TransactionParser {
             max_priority_fee: Some(max_priority_fee),
             data: input_data,
             access_list,
+            authorization_list: Vec::new(),
+            sign_hash,
+            raw_data: data.to_vec(),
+        })
+    }
+
+    /// Parses an EIP-7702 (set-code) transaction.
+    ///
+    /// Wire format (per EIP-7702):
+    ///   0x04 || rlp([chain_id, nonce, max_priority_fee_per_gas, max_fee_per_gas,
+    ///                gas_limit, destination, value, data, access_list,
+    ///                authorization_list, signature_y_parity, signature_r, signature_s])
+    ///
+    /// Unsigned form omits the trailing `(y_parity, r, s)`.
+    fn parse_eip7702(data: &[u8]) -> Result<ParsedTransaction, TxParseError> {
+        if data.is_empty() || data[0] != 0x04 {
+            return Err(TxParseError::UnknownType);
+        }
+
+        let item = rlp::decode_exact(&data[1..])?;
+        let fields = item.as_list().ok_or(TxParseError::InvalidFieldCount)?;
+
+        // EIP-7702: 10 fields unsigned, 13 fields signed.
+        if fields.len() != 10 && fields.len() != 13 {
+            return Err(TxParseError::InvalidFieldCount);
+        }
+
+        let chain_id = fields[0].as_u64().ok_or(TxParseError::InvalidChainId)?;
+        let nonce = fields[1].as_u64().ok_or(TxParseError::MissingField)?;
+        let max_priority_fee = fields[2].as_bytes32().ok_or(TxParseError::MissingField)?;
+        let max_fee = fields[3].as_bytes32().ok_or(TxParseError::MissingField)?;
+        let gas_limit = fields[4].as_u64().ok_or(TxParseError::MissingField)?;
+
+        // EIP-7702: a null destination is explicitly invalid (no contract creation).
+        let to = match parse_to_field(&fields[5])? {
+            Some(addr) => addr,
+            None => return Err(TxParseError::MissingField),
+        };
+
+        let value = fields[6].as_bytes32().ok_or(TxParseError::MissingField)?;
+        let input_data = fields[7]
+            .as_string()
+            .ok_or(TxParseError::MissingField)?
+            .to_vec();
+        let access_list = parse_access_list(&fields[8])?;
+        let authorization_list = parse_authorization_list(&fields[9])?;
+
+        // EIP-7702: an empty authorization list makes the transaction invalid.
+        if authorization_list.is_empty() {
+            return Err(TxParseError::EmptyAuthorizationList);
+        }
+
+        let sign_hash = compute_typed_sign_hash(data)?;
+
+        Ok(ParsedTransaction {
+            tx_type: TransactionType::SetCode,
+            chain_id: Some(chain_id),
+            nonce,
+            to: Some(to),
+            value,
+            gas_limit,
+            gas_price: max_fee,
+            max_priority_fee: Some(max_priority_fee),
+            data: input_data,
+            access_list,
+            authorization_list,
             sign_hash,
             raw_data: data.to_vec(),
         })
@@ -327,6 +404,49 @@ fn parse_access_list(item: &RlpItem<'_>) -> Result<Vec<(EthAddress, Vec<Hash256>
         }
 
         result.push((address, storage_keys));
+    }
+
+    Ok(result)
+}
+
+/// Parses an EIP-7702 authorization list.
+///
+/// Each entry is an RLP list of 6 fields:
+///   `[chain_id, address, nonce, y_parity, r, s]`
+///
+/// `y_parity` is range-checked to `{0, 1}` per the spec; any other value
+/// yields `ValueOutOfRange`. Note this helper does NOT enforce non-empty
+/// list semantics — that's the caller's job (see `parse_eip7702`).
+fn parse_authorization_list(
+    item: &RlpItem<'_>,
+) -> Result<Vec<Eip7702SignedAuthorization>, TxParseError> {
+    let list = item.as_list().ok_or(TxParseError::MissingField)?;
+    let mut result = Vec::new();
+
+    for entry in list {
+        let fields = entry.as_list().ok_or(TxParseError::MissingField)?;
+        if fields.len() != 6 {
+            return Err(TxParseError::InvalidFieldCount);
+        }
+
+        let chain_id = fields[0].as_u64().ok_or(TxParseError::InvalidChainId)?;
+        let address = fields[1].as_address().ok_or(TxParseError::MissingField)?;
+        let nonce = fields[2].as_u64().ok_or(TxParseError::MissingField)?;
+
+        let y_parity = fields[3].as_u64().ok_or(TxParseError::MissingField)?;
+        if y_parity > 1 {
+            return Err(TxParseError::ValueOutOfRange);
+        }
+
+        let r = fields[4].as_bytes32().ok_or(TxParseError::MissingField)?;
+        let s = fields[5].as_bytes32().ok_or(TxParseError::MissingField)?;
+
+        result.push(Eip7702SignedAuthorization {
+            inner: Eip7702Authorization { chain_id, address, nonce },
+            y_parity: y_parity as u8,
+            r,
+            s,
+        });
     }
 
     Ok(result)
@@ -430,6 +550,141 @@ mod tests {
         assert_eq!(parsed.tx_type, TransactionType::Legacy);
     }
 
+    // =========================================================================
+    // EIP-7702 helpers
+    // =========================================================================
+
+    /// Build the RLP encoding of a single authorization tuple
+    /// `[chain_id, address, nonce, y_parity, r, s]`.
+    fn build_auth_tuple(
+        chain_id: u64,
+        address: &[u8; 20],
+        nonce: u64,
+        y_parity: u64,
+        r: &[u8; 32],
+        s: &[u8; 32],
+    ) -> Vec<u8> {
+        let mut inner = Vec::new();
+        inner.extend_from_slice(&rlp::encode_u64(chain_id));
+        inner.extend_from_slice(&rlp::encode_bytes(address));
+        inner.extend_from_slice(&rlp::encode_u64(nonce));
+        inner.extend_from_slice(&rlp::encode_u64(y_parity));
+        inner.extend_from_slice(&rlp::encode_bytes(r));
+        inner.extend_from_slice(&rlp::encode_bytes(s));
+        rlp::encode_list(&inner)
+    }
+
+    /// Build a complete EIP-7702 type-4 transaction. `to` may be empty
+    /// (to exercise the null-destination rejection); `auth_tuples` is the
+    /// concatenated RLP-encoded inner tuples (empty for the empty-list test).
+    fn build_eip7702_tx(to: &[u8], auth_tuples: &[u8]) -> Vec<u8> {
+        let mut fields = Vec::new();
+        fields.extend_from_slice(&rlp::encode_u64(1)); // chain_id
+        fields.extend_from_slice(&rlp::encode_u64(0)); // nonce
+        fields.extend_from_slice(&rlp::encode_u64(1_000_000_000)); // max_priority_fee
+        fields.extend_from_slice(&rlp::encode_u64(50_000_000_000)); // max_fee
+        fields.extend_from_slice(&rlp::encode_u64(50_000)); // gas_limit
+        fields.extend_from_slice(&rlp::encode_bytes(to)); // destination
+        fields.extend_from_slice(&rlp::encode_u64(0)); // value
+        fields.extend_from_slice(&rlp::encode_bytes(&[])); // data
+        fields.extend_from_slice(&rlp::encode_list(&[])); // access_list
+        fields.extend_from_slice(&rlp::encode_list(auth_tuples)); // authorization_list
+        let rlp_payload = rlp::encode_list(&fields);
+        let mut tx_data = vec![0x04];
+        tx_data.extend_from_slice(&rlp_payload);
+        tx_data
+    }
+
+    #[test]
+    fn test_parse_eip7702_happy_path() {
+        let auth = build_auth_tuple(1, &[0xab; 20], 0, 0, &[0x11; 32], &[0x22; 32]);
+        let tx = build_eip7702_tx(&[0xde; 20], &auth);
+        let parsed = TransactionParser::parse(&tx).unwrap();
+
+        assert_eq!(parsed.tx_type, TransactionType::SetCode);
+        assert_eq!(parsed.chain_id, Some(1));
+        assert_eq!(parsed.nonce, 0);
+        assert_eq!(parsed.to, Some([0xde; 20]));
+        assert!(parsed.max_priority_fee.is_some());
+        assert_eq!(parsed.authorization_list.len(), 1);
+
+        let a = &parsed.authorization_list[0];
+        assert_eq!(a.inner.chain_id, 1);
+        assert_eq!(a.inner.address, [0xab; 20]);
+        assert_eq!(a.inner.nonce, 0);
+        assert_eq!(a.y_parity, 0);
+        assert_eq!(a.r, [0x11; 32]);
+        assert_eq!(a.s, [0x22; 32]);
+    }
+
+    #[test]
+    fn test_parse_eip7702_multiple_authorizations() {
+        // Two distinct EOAs delegating to two different contracts in one tx.
+        let auth1 = build_auth_tuple(1, &[0xaa; 20], 0, 0, &[0x11; 32], &[0x22; 32]);
+        let auth2 = build_auth_tuple(1, &[0xbb; 20], 42, 1, &[0x33; 32], &[0x44; 32]);
+        let mut auths = Vec::new();
+        auths.extend_from_slice(&auth1);
+        auths.extend_from_slice(&auth2);
+
+        let tx = build_eip7702_tx(&[0xde; 20], &auths);
+        let parsed = TransactionParser::parse(&tx).unwrap();
+
+        assert_eq!(parsed.authorization_list.len(), 2);
+        assert_eq!(parsed.authorization_list[0].inner.address, [0xaa; 20]);
+        assert_eq!(parsed.authorization_list[1].inner.address, [0xbb; 20]);
+        assert_eq!(parsed.authorization_list[1].inner.nonce, 42);
+        assert_eq!(parsed.authorization_list[1].y_parity, 1);
+    }
+
+    #[test]
+    fn test_parse_eip7702_rejects_null_destination() {
+        // EIP-7702 forbids contract creation — an empty `to` field is invalid.
+        let auth = build_auth_tuple(1, &[0xab; 20], 0, 0, &[0x11; 32], &[0x22; 32]);
+        let tx = build_eip7702_tx(&[], &auth);
+        let result = TransactionParser::parse(&tx);
+        assert!(matches!(result, Err(TxParseError::MissingField)));
+    }
+
+    #[test]
+    fn test_parse_eip7702_rejects_empty_authorization_list() {
+        let tx = build_eip7702_tx(&[0xde; 20], &[]);
+        let result = TransactionParser::parse(&tx);
+        assert!(matches!(result, Err(TxParseError::EmptyAuthorizationList)));
+    }
+
+    #[test]
+    fn test_parse_eip7702_rejects_invalid_y_parity() {
+        // Per spec, y_parity must be 0 or 1; anything else is invalid.
+        let auth = build_auth_tuple(1, &[0xab; 20], 0, 2, &[0x11; 32], &[0x22; 32]);
+        let tx = build_eip7702_tx(&[0xde; 20], &auth);
+        let result = TransactionParser::parse(&tx);
+        assert!(matches!(result, Err(TxParseError::ValueOutOfRange)));
+    }
+
+    #[test]
+    fn test_parse_eip7702_rejects_wrong_field_count() {
+        let mut fields = Vec::new();
+        fields.extend_from_slice(&rlp::encode_u64(1)); // chain_id
+        fields.extend_from_slice(&rlp::encode_u64(0)); // nonce
+        fields.extend_from_slice(&rlp::encode_u64(0)); // max_priority_fee
+        fields.extend_from_slice(&rlp::encode_u64(0)); // max_fee
+        fields.extend_from_slice(&rlp::encode_u64(21000)); // gas_limit
+        let rlp_payload = rlp::encode_list(&fields);
+        let mut tx = vec![0x04];
+        tx.extend_from_slice(&rlp_payload);
+
+        let result = TransactionParser::parse(&tx);
+        assert!(matches!(result, Err(TxParseError::InvalidFieldCount)));
+    }
+
+    #[test]
+    fn test_dispatch_routes_type_4() {
+        let auth = build_auth_tuple(1, &[0xab; 20], 0, 0, &[0x11; 32], &[0x22; 32]);
+        let tx = build_eip7702_tx(&[0xde; 20], &auth);
+        let parsed = TransactionParser::parse(&tx).expect("0x04 must dispatch to parse_eip7702");
+        assert_eq!(parsed.tx_type, TransactionType::SetCode);
+    }
+
     #[test]
     fn test_parse_eip1559() {
         // Construct an unsigned EIP-1559 transaction
@@ -456,4 +711,29 @@ mod tests {
         assert_eq!(parsed.tx_type, TransactionType::FeeMarket);
         assert!(parsed.max_priority_fee.is_some());
     }
+
+    /// Build an auth tuple encoding r/s with leading zeros stripped, exactly
+    /// as `rlp_encode_auth_tuple` in holodi/beth does with `trim_leading_zeros`.
+    fn build_auth_tuple_trimmed(
+        chain_id: u64,
+        address: &[u8; 20],
+        nonce: u64,
+        y_parity: u64,
+        r: &[u8; 32],
+        s: &[u8; 32],
+    ) -> Vec<u8> {
+        fn trim(bytes: &[u8]) -> &[u8] {
+            let start = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
+            &bytes[start..]
+        }
+        let mut inner = Vec::new();
+        inner.extend_from_slice(&rlp::encode_u64(chain_id));
+        inner.extend_from_slice(&rlp::encode_bytes(address));
+        inner.extend_from_slice(&rlp::encode_u64(nonce));
+        inner.extend_from_slice(&rlp::encode_u64(y_parity));
+        inner.extend_from_slice(&rlp::encode_bytes(trim(r))); // trimmed, like beth
+        inner.extend_from_slice(&rlp::encode_bytes(trim(s))); // trimmed, like beth
+        rlp::encode_list(&inner)
+    }
+
 }

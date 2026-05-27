@@ -151,6 +151,7 @@ pub fn display_transaction<P: Platform>(
                 TransactionType::Legacy => "Legacy",
                 TransactionType::AccessList => "EIP-2930",
                 TransactionType::FeeMarket => "EIP-1559",
+                TransactionType::SetCode => "EIP-7702",
             };
 
             let recipient = match &tx.to {
@@ -182,9 +183,14 @@ pub fn display_transaction<P: Platform>(
             ]
         };
 
-        // Add max priority fee for EIP-1559
+        // Add max priority fee for EIP-1559/EIP-7702
         if let Some(priority_fee) = &tx.max_priority_fee {
             fields.push(("Priority Fee", format_gas_price(priority_fee)));
+        }
+
+        // For EIP-7702: show how many EOAs are delegating in this transaction.
+        if tx.tx_type == TransactionType::SetCode && !tx.authorization_list.is_empty() {
+            fields.push(("Authorizations", format!("{}", tx.authorization_list.len())));
         }
 
         let field_refs: Vec<(&str, &str)> = fields
@@ -193,6 +199,49 @@ pub fn display_transaction<P: Platform>(
             .collect();
 
         platform.show_transaction_review(&field_refs, "Sign transaction")
+    }
+}
+
+/// Display an EIP-7702 authorization tuple for signing confirmation.
+///
+/// Shows the chain ID, delegate contract address, and nonce so the user
+/// can verify they are authorizing the correct delegation.
+#[allow(unused_variables)]
+pub fn display_eip7702_auth<P: Platform>(
+    platform: &P,
+    chain_id: u64,
+    address: &EthAddress,
+    nonce: u64,
+) -> Result<bool, EthAppError> {
+    #[cfg(feature = "autoapprove")]
+    {
+        return Ok(true);
+    }
+
+    #[cfg(not(feature = "autoapprove"))]
+    {
+        let chain_str = if chain_id == 0 {
+            String::from("0 (any chain)")
+        } else {
+            format!("{}", chain_id)
+        };
+        let checksummed = format_address_checksummed(address);
+        let addr_str = String::from_utf8_lossy(&checksummed).into_owned();
+        let nonce_str = format!("{}", nonce);
+
+        let fields = vec![
+            ("Type",     String::from("EIP-7702 Authorization")),
+            ("Chain ID", chain_str),
+            ("Delegate", addr_str),
+            ("Nonce",    nonce_str),
+        ];
+
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v): &(&str, String)| (*k, v.as_str()))
+            .collect();
+
+        platform.show_transaction_review(&field_refs, "Sign EIP-7702 authorization")
     }
 }
 

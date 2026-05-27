@@ -305,6 +305,71 @@ fn process_sign_transaction_inner(
     Ok((signature, sign_hash))
 }
 
+/// Process an EIP-7702 authorization tuple signing request.
+///
+/// Wire payload (after the BIP44 path prefix):
+///   [chain_id: 8 bytes BE][address: 20 bytes][nonce: 8 bytes BE]
+///
+/// Computes `keccak256(0x05 || rlp([chain_id, address, nonce]))` and signs
+/// it via bao-seed. Returns a signature with `v = y_parity` (0 or 1).
+fn process_sign_eip7702_auth(
+    state: &mut ServiceState,
+    path: &Bip32Path,
+    auth_data: &[u8],
+) -> Result<Signature, EthAppError> {
+    if !path.is_valid_ethereum_path() {
+        return Err(EthAppError::InvalidDerivationPath);
+    }
+
+    // Expect exactly: chain_id (8) + address (20) + nonce (8) = 36 bytes.
+    if auth_data.len() != 36 {
+        return Err(EthAppError::InvalidData);
+    }
+
+    let chain_id = u64::from_be_bytes(auth_data[0..8].try_into().unwrap());
+    let mut address = [0u8; 20];
+    address.copy_from_slice(&auth_data[8..28]);
+    let nonce = u64::from_be_bytes(auth_data[28..36].try_into().unwrap());
+
+    // Guard: refuse to sign on mainnet in dev-mode/autoapprove builds lack a trusted display
+    #[cfg(any(feature = "autoapprove", feature = "dev-mode"))]
+    {
+        if is_mainnet_chain(chain_id) && !state.dangerous_mainnet {
+            log::error!(
+                "ethapp: REFUSING to sign EIP-7702 auth on chain {} in dev-mode/autoapprove build. \
+                 Use EnableDangerousMainnet to override at your own risk.",
+                chain_id,
+            );
+            return Err(EthAppError::UnsupportedOperation);
+        }
+    }
+
+    // Display the authorization tuple for user confirmation.
+    if !ui::display_eip7702_auth(&state.platform, chain_id, &address, nonce)? {
+        state.record_sign_rejected();
+        return Err(EthAppError::RejectedByUser);
+    }
+
+    let sign_hash = crate::crypto::eip7702_authorization_hash(chain_id, &address, nonce);
+
+    let path_vec = path.components.clone();
+    let raw = state.bao_seed()?
+        .secp256k1_sign(path_vec, sign_hash)
+        .map_err(map_bao_seed_err)?;
+
+    // v = y_parity (0 or 1) — no EIP-155 chain-id encoding for auth tuples.
+    let signature = crate::crypto::compose_eth_signature(
+        raw,
+        None,
+        ethapp_common::TransactionType::SetCode,
+    )?;
+
+    state.platform.show_info(true, "EIP-7702 authorization signed");
+    state.record_sign_success();
+
+    Ok(signature)
+}
+
 /// Handle ClearSignTransaction request.
 #[cfg(any(target_os = "xous", feature = "hosted-dabao"))]
 pub fn handle_clear_sign_transaction(
@@ -1605,6 +1670,19 @@ fn process_serial_command(
             }
         }
 
+        // SignEip7702Auth — payload: [path_bytes...][chain_id:8BE][address:20][nonce:8BE]
+        0x23 => {
+            match parse_bip32_path_and_remainder(payload) {
+                Some((path, auth_data)) => {
+                    match process_sign_eip7702_auth(state, &path, auth_data) {
+                        Ok(sig) => signature_response(&sig),
+                        Err(e) => vec![error_to_status(&e)],
+                    }
+                }
+                None => vec![STATUS_ERR_INVALID_PATH],
+            }
+        }
+
         // SignTransaction — payload: [path_bytes...][rlp_tx_bytes...]
         0x10 => {
             match parse_bip32_path_and_remainder(payload) {
@@ -1748,4 +1826,90 @@ fn signature_response(sig: &Signature) -> Vec<u8> {
     out.extend_from_slice(&sig.r);
     out.extend_from_slice(&sig.s);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::serial::{STATUS_ERR_INVALID_PATH, STATUS_ERR_INTERNAL};
+    use ethapp_common::Bip32Path;
+
+    /// Serialize a Bip32Path to the wire format expected by
+    /// `parse_bip32_path_and_remainder`: [depth, comp0_BE...compN_BE].
+    fn path_to_wire(path: &Bip32Path) -> Vec<u8> {
+        let mut buf = vec![path.len() as u8];
+        for c in path.as_slice() {
+            buf.extend_from_slice(&c.to_be_bytes());
+        }
+        buf
+    }
+
+    /// Build a valid 36-byte auth payload:
+    /// [chain_id: 8 BE][address: 20][nonce: 8 BE]
+    fn auth_payload(chain_id: u64, address: [u8; 20], nonce: u64) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(36);
+        buf.extend_from_slice(&chain_id.to_be_bytes());
+        buf.extend_from_slice(&address);
+        buf.extend_from_slice(&nonce.to_be_bytes());
+        buf
+    }
+
+    // =========================================================================
+    // process_sign_eip7702_auth — input validation (no bao-seed needed)
+    // =========================================================================
+
+    #[test]
+    fn test_sign_eip7702_auth_rejects_invalid_path() {
+        let mut state = crate::state::ServiceState::new();
+        // depth=0 is rejected by is_valid_ethereum_path()
+        let bad_path = Bip32Path::from_slice(&[]);
+        let payload = auth_payload(1, [0xab; 20], 0);
+        let result = process_sign_eip7702_auth(&mut state, &bad_path, &payload);
+        assert!(matches!(result, Err(EthAppError::InvalidDerivationPath)));
+    }
+
+    #[test]
+    fn test_sign_eip7702_auth_rejects_short_payload() {
+        let mut state = crate::state::ServiceState::new();
+        let path = Bip32Path::ethereum(0, 0, 0);
+        // 35 bytes — one short of the required 36
+        let short = vec![0u8; 35];
+        let result = process_sign_eip7702_auth(&mut state, &path, &short);
+        assert!(matches!(result, Err(EthAppError::InvalidData)));
+    }
+
+    #[test]
+    fn test_sign_eip7702_auth_rejects_long_payload() {
+        let mut state = crate::state::ServiceState::new();
+        let path = Bip32Path::ethereum(0, 0, 0);
+        // 37 bytes — one too many
+        let long = vec![0u8; 37];
+        let result = process_sign_eip7702_auth(&mut state, &path, &long);
+        assert!(matches!(result, Err(EthAppError::InvalidData)));
+    }
+
+    #[test]
+    fn test_serial_0x23_bad_path_returns_invalid_path_status() {
+        let mut state = crate::state::ServiceState::new();
+        let payload = {
+            let mut p = vec![0u8]; // depth = 0, invalid
+            p.extend_from_slice(&auth_payload(1, [0xab; 20], 0));
+            p
+        };
+        let resp = process_serial_command(&mut state, 0x23, &payload);
+        assert_eq!(resp[0], STATUS_ERR_INVALID_PATH);
+    }
+
+    #[test]
+    fn test_serial_0x23_truncated_auth_payload_returns_error() {
+        // Test valid path prefix, but only 10 bytes of auth data (need 36)
+        let mut state = crate::state::ServiceState::new();
+        let payload = {
+            let mut p = path_to_wire(&Bip32Path::ethereum(0, 0, 0));
+            p.extend_from_slice(&[0u8; 10]);
+            p
+        };
+        let resp = process_serial_command(&mut state, 0x23, &payload);
+        assert_ne!(resp[0], crate::serial::STATUS_OK);
+    }
 }

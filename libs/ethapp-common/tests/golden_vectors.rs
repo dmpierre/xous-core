@@ -221,6 +221,64 @@ mod transactions {
     }
 
     #[test]
+    fn test_eip7702_tx_structure() {
+        // EIP-7702: 0x04 || rlp([chain_id, nonce, max_priority_fee, max_fee,
+        //                         gas_limit, destination, value, data,
+        //                         access_list, authorization_list])
+        // authorization_list = [[chain_id, address, nonce, y_parity, r, s], ...]
+        // Reference: https://eips.ethereum.org/EIPS/eip-7702
+        let mut auth = Vec::new();
+        auth.extend_from_slice(&rlp::encode_u64(1));              // auth.chain_id = 1
+        auth.extend_from_slice(&rlp::encode_bytes(&[0xab; 20])); // auth.address
+        auth.extend_from_slice(&rlp::encode_u64(0));              // auth.nonce
+        auth.extend_from_slice(&rlp::encode_u64(0));              // y_parity = 0
+        auth.extend_from_slice(&rlp::encode_bytes(&[0x11; 32])); // r
+        auth.extend_from_slice(&rlp::encode_bytes(&[0x22; 32])); // s
+        let auth_tuple = rlp::encode_list(&auth);
+
+        // Verify the tuple itself has 6 fields
+        let decoded_auth = rlp::decode_exact(&auth_tuple).unwrap();
+        let auth_fields = decoded_auth.as_list().unwrap();
+        assert_eq!(auth_fields.len(), 6);
+        assert_eq!(auth_fields[0].as_u64(), Some(1));         // chain_id
+        assert_eq!(auth_fields[1].as_address(), Some([0xab; 20])); // address
+        assert_eq!(auth_fields[2].as_u64(), Some(0));         // nonce
+        assert_eq!(auth_fields[3].as_u64(), Some(0));         // y_parity
+
+        // Build the outer transaction
+        let mut fields = Vec::new();
+        fields.extend_from_slice(&rlp::encode_u64(1));               // chain_id
+        fields.extend_from_slice(&rlp::encode_u64(0));               // nonce
+        fields.extend_from_slice(&rlp::encode_u64(1_000_000_000));   // max_priority_fee
+        fields.extend_from_slice(&rlp::encode_u64(50_000_000_000));  // max_fee
+        fields.extend_from_slice(&rlp::encode_u64(50_000));          // gas_limit
+        fields.extend_from_slice(&rlp::encode_bytes(&[0xde; 20]));   // destination
+        fields.extend_from_slice(&rlp::encode_u64(0));               // value
+        fields.extend_from_slice(&rlp::encode_bytes(&[]));           // data
+        fields.extend_from_slice(&rlp::encode_list(&[]));            // access_list (empty)
+        fields.extend_from_slice(&rlp::encode_list(&auth_tuple));    // authorization_list
+
+        let rlp_payload = rlp::encode_list(&fields);
+        let mut tx = vec![0x04u8];
+        tx.extend_from_slice(&rlp_payload);
+
+        // Type byte must be 0x04
+        assert_eq!(tx[0], 0x04);
+
+        // Unsigned form must decode to exactly 10 top-level fields
+        let item = rlp::decode_exact(&rlp_payload).unwrap();
+        let list = item.as_list().unwrap();
+        assert_eq!(list.len(), 10);
+
+        assert_eq!(list[0].as_u64(), Some(1));              // chain_id at index 0
+        assert_eq!(list[5].as_address(), Some([0xde; 20])); // destination at index 5
+
+        // authorization_list is at index 9 and contains one entry
+        let auth_list = list[9].as_list().unwrap();
+        assert_eq!(auth_list.len(), 1);
+    }
+
+    #[test]
     fn test_contract_creation_empty_to() {
         // Contract creation has empty "to" field
         let mut fields = Vec::new();

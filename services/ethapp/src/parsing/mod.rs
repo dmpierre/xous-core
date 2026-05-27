@@ -2,7 +2,7 @@
 //!
 //! This module provides:
 //! - RLP (Recursive Length Prefix) decoding (re-exported from ethapp-common)
-//! - Transaction parsing (legacy, EIP-2930, EIP-1559)
+//! - Transaction parsing (legacy, EIP-2930, EIP-1559, EIP-7702)
 //! - EIP-712 typed data parsing
 //!
 //! # Security
